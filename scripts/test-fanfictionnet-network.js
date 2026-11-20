@@ -15,58 +15,161 @@ const challenge = () =>
     status: 403,
     headers: { 'cf-mitigated': 'challenge' },
   });
+const denyListBlock = () =>
+  new Response('<title>Attention Required! | Cloudflare</title>', {
+    status: 403,
+  });
+
+const storyHtml = (
+  id,
+  { title = `Story ${id}`, chapters = 1, complete = false } = {},
+) => {
+  const options =
+    chapters > 1
+      ? `<select id="chap_select">${Array.from(
+          { length: chapters },
+          (_, i) => `<option value="${i + 1}">${i + 1}. Ch ${i + 1}</option>`,
+        ).join('')}</select>`
+      : '';
+  return (
+    `<div id="pre_story_links"><a href="/book/">Books</a><a href="/book/Harry-Potter/">Harry Potter</a></div>` +
+    `<div id="profile_top">` +
+    `<b class="xcontrast_txt">${title}</b>` +
+    `<a href="/u/42/Author/">Author</a>` +
+    `<span class="xgray">Rated: Fiction T - English - Fantasy - Chapters: ${chapters}${complete ? ' - Status: Complete' : ''}</span>` +
+    `<div class="xcontrast_txt">Summary</div>` +
+    `</div>` +
+    options +
+    chapter
+  );
+};
 
 function harness(fetchApi, fetchViaWebview, state = new Map()) {
-  const time = { now: Date.UTC(2026, 10, 21) };
+  const time = { now: Date.UTC(2026, 10, 21, 12, 0, 0) };
+  let nextTimerId = 1;
+  const pendingTimers = new Map();
+  const pacingDelays = [];
+
   class Clock extends Date {
     static now() {
       return time.now;
     }
   }
+
+  const fakeSetTimeout = (callback, delay = 0) => {
+    const id = nextTimerId++;
+    if (delay <= 5000) {
+      pacingDelays.push(delay);
+      let cancelled = false;
+      pendingTimers.set(id, {
+        cancel: () => {
+          cancelled = true;
+        },
+      });
+      queueMicrotask(() => {
+        if (cancelled) return;
+        pendingTimers.delete(id);
+        time.now += delay;
+        callback();
+      });
+      return id;
+    }
+    pendingTimers.set(id, {
+      fireAt: time.now + delay,
+      callback,
+    });
+    return id;
+  };
+
+  const fakeClearTimeout = id => {
+    const entry = pendingTimers.get(id);
+    if (entry?.cancel) entry.cancel();
+    pendingTimers.delete(id);
+  };
+
+  const advanceTime = async ms => {
+    time.now += ms;
+    const due = [];
+    for (const [id, entry] of pendingTimers.entries()) {
+      if (entry.fireAt !== undefined && entry.fireAt <= time.now) {
+        pendingTimers.delete(id);
+        due.push(entry);
+      }
+    }
+    due.sort((a, b) => a.fireAt - b.fireAt);
+    for (const entry of due) entry.callback();
+    await new Promise(resolve => setImmediate(resolve));
+  };
+
   const exports = {};
   const modules = {
     '@libs/fetch': { fetchApi, fetchViaWebview },
     '@libs/filterInputs': { FilterTypes: {} },
-    '@libs/novelStatus': { NovelStatus: {} },
+    '@libs/novelStatus': {
+      NovelStatus: { Completed: 'Completed', Ongoing: 'Ongoing' },
+    },
     '@libs/defaultCover': { defaultCover: 'cover' },
     '@libs/storage': {
       storage: {
-        get: key => state.get(key)?.value,
-        set: (key, value, expires) => state.set(key, { value, expires }),
-        getAllKeys: () => [],
+        get: (key, raw) => {
+          const entry = state.get(key);
+          if (!entry) return undefined;
+          if (entry.expires && time.now > entry.expires) {
+            state.delete(key);
+            return undefined;
+          }
+          return raw ? entry : entry.value;
+        },
+        set: (key, value, expires) =>
+          state.set(key, { created: new Date(time.now), value, expires }),
+        getAllKeys: () => Array.from(state.keys()),
         delete: key => state.delete(key),
       },
     },
   };
   vm.runInNewContext(code, {
+    AbortController,
     Date: Clock,
+    clearTimeout: fakeClearTimeout,
     exports,
     require: key => modules[key] ?? require(key),
-    setTimeout: (callback, delay) =>
-      queueMicrotask(() => {
-        time.now += delay;
-        callback();
-      }),
+    setTimeout: fakeSetTimeout,
   });
-  return { plugin: exports.default, time };
+  return { plugin: exports.default, time, advanceTime, pacingDelays, state };
 }
 
-const accountPage = (start, end, total, next) => {
+const accountPage = (
+  start,
+  end,
+  total,
+  next,
+  {
+    accountId = '1001',
+    accountName = 'ReaderA',
+    updated = '11-17-2026',
+    listLabel = 'Favorite Stories',
+    pathFile = 'story.php',
+  } = {},
+) => {
   const rows = Array.from(
     { length: end - start + 1 },
     (_, index) =>
-      `<tr><td><a href="/s/${start + index}/1/">Story</a></td><td>Author</td><td>Fandom</td><td>11-17-2026</td></tr>`,
+      `<tr><td><a href="/s/${start + index}/1/">Story ${start + index}</a></td><td><a href="/u/9999/Author/">Author</a></td><td>Fandom</td><td>${typeof updated === 'function' ? updated(start + index) : updated}</td></tr>`,
   ).join('');
+  const profileLink = accountId
+    ? `<a href="/u/${accountId}/${accountName}/">${accountName}</a>`
+    : '';
   return (
-    `<a href="/logout.php">Log out</a><b>Favorite Stories (${total})</b>` +
+    `<div id="top">${profileLink}<a href="/logout.php">Log out</a></div>` +
+    `<b>${listLabel} (${total})</b>` +
     '<table><tr><th>Story</th><th>Author</th><th>Category</th><th>Updated</th></tr>' +
     rows +
     '</table>' +
-    (next ? `<a href="story.php?p=${next}">Next</a>` : '')
+    (next ? `<a href="${pathFile}?p=${next}">Next</a>` : '')
   );
 };
 
-test('opens one account page, reuses it during a challenge and avoids a request past the end', async () => {
+test('opens one account page, reuses it during a challenge within stale cap, and avoids a request past the end', async () => {
   const requests = [];
   let blocked = false;
   const { plugin, time } = harness(async url => {
@@ -85,7 +188,8 @@ test('opens one account page, reuses it during a challenge and avoids a request 
   assert.equal((await plugin.popularNovels(3, options)).length, 0);
   assert.equal(requests.length, 2);
 
-  time.now += 360_000;
+  // 6 minutes later (> 5m fresh TTL, <= 30m stale max age): serves same account's cached page.
+  time.now += 6 * 60_000;
   blocked = true;
   assert.equal((await plugin.popularNovels(1, options)).length, 50);
   await assert.rejects(plugin.parseChapter('s/1/1/'), {
@@ -93,6 +197,84 @@ test('opens one account page, reuses it during a challenge and avoids a request 
   });
   assert.equal(requests.length, 3);
   assert.equal(plugin.getRequestDiagnostics().staleHits, 1);
+
+  // Past 30-minute stale cap: withholds stale private page during challenge.
+  time.now += 31 * 60_000;
+  await assert.rejects(plugin.popularNovels(1, options), {
+    name: 'SourceUpdatePaused',
+  });
+  assert.equal(requests.length, 4);
+});
+
+test('isolates private account cache on Account A -> Account B switch and logout followed by challenge', async () => {
+  let mode = 'accountA';
+  const requests = [];
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    if (mode === 'challenge') return challenge();
+    if (mode === 'loggedOut')
+      return new Response('<html><body>Please sign in</body></html>');
+    if (mode === 'accountB') {
+      return new Response(
+        accountPage(201, 250, 260, 2, {
+          accountId: '2002',
+          accountName: 'ReaderB',
+        }),
+      );
+    }
+    return new Response(
+      url.endsWith('?p=2')
+        ? accountPage(51, 60, 60, undefined, { accountId: '1001' })
+        : accountPage(1, 50, 60, 2, { accountId: '1001' }),
+    );
+  });
+  const options = { filters: { list: { value: 'favorites' } } };
+
+  // Account A caches page 1 and page 2.
+  const a1 = await plugin.popularNovels(1, options);
+  const a2 = await plugin.popularNovels(2, options);
+  assert.equal(a1[0].path, 's/1/');
+  assert.equal(a2[0].path, 's/51/');
+
+  // Switch to Account B after TTL expires, fetch page 1, then hit challenge on page 2.
+  time.now += 6 * 60_000;
+  mode = 'accountB';
+  const b1 = await plugin.popularNovels(1, options);
+  assert.equal(b1[0].path, 's/201/');
+
+  mode = 'challenge';
+  await assert.rejects(plugin.popularNovels(2, options), {
+    name: 'SourceUpdatePaused',
+  });
+
+  // After cooldown, log out, then immediately hit a challenge on page 1: must NOT serve Account B's page 1.
+  time.now += 10 * 60_000;
+  mode = 'loggedOut';
+  await assert.rejects(plugin.popularNovels(1, options), {
+    name: 'AccountListError',
+  });
+  mode = 'challenge';
+  await assert.rejects(plugin.popularNovels(1, options), {
+    name: 'SourceUpdatePaused',
+  });
+});
+
+test('withholds private stale pages when account identity cannot be established (ignoring table author links)', async () => {
+  let blocked = false;
+  const { plugin, time } = harness(async () => {
+    if (blocked) return challenge();
+    // No accountId outside <table>; story rows still have /u/9999/Author/ links inside <table>.
+    return new Response(accountPage(1, 50, 50, undefined, { accountId: '' }));
+  });
+  const options = { filters: { list: { value: 'favorites' } } };
+  assert.equal((await plugin.popularNovels(1, options)).length, 50);
+
+  time.now += 6 * 60_000;
+  blocked = true;
+  await assert.rejects(plugin.popularNovels(1, options), {
+    name: 'SourceUpdatePaused',
+  });
+  assert.equal(plugin.getRequestDiagnostics().staleHits, 0);
 });
 
 test('prioritizes a reader and shares an overlapping chapter request', async () => {
@@ -123,36 +305,259 @@ test('prioritizes a reader and shares an overlapping chapter request', async () 
   assert.equal(plugin.getRequestDiagnostics().cacheHits, 1);
 });
 
-test('keeps a verification pause across plugin reloads and allows cached reading', async () => {
+test('times out a stalled fetch so foreground reading is never blocked forever', async () => {
+  let hungSignal;
+  const { plugin, advanceTime } = harness(async (url, init) => {
+    if (url.includes('/s/1/')) {
+      hungSignal = init?.signal;
+      return new Promise(() => {});
+    }
+    return new Response(chapter);
+  });
+
+  const stalled = plugin.parseChapter('s/1/1/', 'background');
+  const stalledRejected = assert.rejects(stalled, /timed out/i);
+  const reader = plugin.parseChapter('s/2/1/');
+  await new Promise(resolve => setImmediate(resolve));
+
+  await advanceTime(25_000);
+  await stalledRejected;
+  assert.equal(hungSignal?.aborted, true);
+  assert.match(await reader, /Chapter text/);
+});
+
+test('uses bounded exponential backoff on challenges and deny-list 403s, and recovers without app callbacks', async () => {
   const storage = new Map();
+  let responseMode = 'challenge';
   let requests = 0;
+
   const first = harness(
     async url => {
       requests += 1;
-      return url.includes('/s/1/') ? new Response(chapter) : challenge();
+      if (url.includes('/s/1/')) return new Response(chapter);
+      if (responseMode === 'ok') return new Response(chapter);
+      if (responseMode === 'deny') return denyListBlock();
+      return challenge();
     },
     async () => ({ ok: false }),
     storage,
   );
+
   await first.plugin.parseChapter('s/1/1/');
-  await assert.rejects(first.plugin.parseChapter('s/2/1/'), {
-    name: 'SourceUpdatePaused',
+  // Strike 1: 5-minute pause (finite retryAt, never undefined).
+  await assert.rejects(first.plugin.parseChapter('s/2/1/'), err => {
+    assert.equal(err.name, 'SourceUpdatePaused');
+    assert.equal(typeof err.retryAt, 'number');
+    assert.equal(err.retryAt - first.time.now, 5 * 60_000);
+    return true;
   });
+
+  // Reload plugin: still paused, cached chapter still readable, 0 new network requests for uncached chapter.
   const next = harness(
     async () => {
       requests += 1;
-      return new Response(chapter);
+      if (responseMode === 'ok') return new Response(chapter);
+      if (responseMode === 'deny') return denyListBlock();
+      return challenge();
     },
     async () => ({ ok: false }),
     storage,
   );
+  next.time.now = first.time.now + 60_000;
   await next.plugin.parseChapter('s/1/1/');
   await assert.rejects(next.plugin.parseChapter('s/2/1/'), {
     name: 'SourceUpdatePaused',
   });
   assert.equal(requests, 2);
 
-  next.plugin.onSourceWebViewVerified();
-  await next.plugin.parseChapter('s/2/1/');
+  // Strike 2 after 5m cooldown using a 403 Cloudflare deny-list page -> escalates to 15m.
+  next.time.now = first.time.now + 5 * 60_000 + 1;
+  responseMode = 'deny';
+  await assert.rejects(next.plugin.parseChapter('s/2/1/'), err => {
+    assert.equal(err.name, 'SourceUpdatePaused');
+    assert.equal(err.retryAt - next.time.now, 15 * 60_000);
+    return true;
+  });
   assert.equal(requests, 3);
+
+  // Strike 3 after 15m cooldown -> caps at 30m.
+  next.time.now += 15 * 60_000 + 1;
+  await assert.rejects(next.plugin.parseChapter('s/2/1/'), err => {
+    assert.equal(err.name, 'SourceUpdatePaused');
+    assert.equal(err.retryAt - next.time.now, 30 * 60_000);
+    return true;
+  });
+  assert.equal(requests, 4);
+
+  // After 30m cooldown, clean response clears pause and resets strike count.
+  next.time.now += 30 * 60_000 + 1;
+  responseMode = 'ok';
+  assert.match(await next.plugin.parseChapter('s/2/1/'), /Chapter text/);
+  assert.equal(requests, 5);
+
+  // Next challenge starts back at 5m (strike 1), not 30m.
+  responseMode = 'challenge';
+  await assert.rejects(next.plugin.parseChapter('s/3/1/'), err => {
+    assert.equal(err.name, 'SourceUpdatePaused');
+    assert.equal(err.retryAt - next.time.now, 5 * 60_000);
+    return true;
+  });
+
+  // Optional WebView callback still clears verification pause early.
+  next.plugin.onSourceWebViewVerified();
+  responseMode = 'ok';
+  assert.match(await next.plugin.parseChapter('s/3/1/'), /Chapter text/);
+});
+
+test('caps a 995-story cold stock LNReader sweep at 15 live fetches and resumes cleanly next window', async () => {
+  const storyRequests = [];
+  const { plugin, time, pacingDelays } = harness(async url => {
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      storyRequests.push(Number(match[1]));
+      return new Response(storyHtml(match[1], { complete: true }));
+    }
+    return new Response('<html><body>Sign in</body></html>');
+  });
+
+  // Simulate stock LNReader 2.1.4 updateLibrary loop: 1-arg parseNovel, 1s sleep on success, 0s on error.
+  let pausedErrors = 0;
+  for (let id = 1; id <= 995; id += 1) {
+    try {
+      await plugin.parseNovel(`s/${id}/`);
+      time.now += 1000;
+    } catch (error) {
+      assert.equal(error.name, 'SourceUpdatePaused');
+      pausedErrors += 1;
+    }
+  }
+
+  assert.equal(storyRequests.length, 15);
+  assert.deepEqual(
+    storyRequests,
+    Array.from({ length: 15 }, (_, i) => i + 1),
+  );
+  assert.equal(pausedErrors, 980);
+  // Batch pacing delays should be jittered between 2.5s and 4.0s (accounting for LNReader's 1s sleep).
+  assert.ok(pacingDelays.some(d => d >= 1500 && d <= 4000));
+
+  // Interactive single-story open (> 5s later) still works even after batch budget is exhausted.
+  time.now += 10_000;
+  const interactive = await plugin.parseNovel('s/999/');
+  assert.equal(interactive.name, 'Story 999');
+  assert.equal(storyRequests.length, 16);
+
+  // Next window (16 minutes later): re-running from story #1 skips completed baselines #1..#15 in 0 requests
+  // (story #1 is isolated first call so 1 live fetch or #16..#30 get baselined, total <= 15 live fetches).
+  storyRequests.length = 0;
+  time.now += 16 * 60_000;
+  for (let id = 1; id <= 40; id += 1) {
+    try {
+      await plugin.parseNovel(`s/${id}/`);
+      time.now += 1000;
+    } catch (error) {
+      assert.equal(error.name, 'SourceUpdatePaused');
+    }
+  }
+  assert.equal(storyRequests.length, 15);
+  // Stories #2..#15 were skipped completely (0 requests); #16..#29 were newly baselined.
+  for (let id = 2; id <= 15; id += 1) {
+    assert.ok(
+      !storyRequests.includes(id),
+      `Expected story ${id} to be skipped`,
+    );
+  }
+  assert.ok(storyRequests.includes(16));
+  assert.ok(storyRequests.includes(29));
+});
+
+test('uses signed-in account list dates to skip unchanged stories without bumping fetchedAt', async () => {
+  const storyRequests = [];
+  const accountRequests = [];
+  let chapterCountFor3 = 1;
+  const { plugin, time, state } = harness(async url => {
+    if (url.includes('/alert/story.php')) {
+      accountRequests.push(url);
+      return new Response(
+        accountPage(1, 3, 3, undefined, {
+          listLabel: 'Stories you are following',
+          updated: id => (id === 3 ? '11-21-2026' : '11-10-2026'),
+        }),
+      );
+    }
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      const id = Number(match[1]);
+      storyRequests.push(id);
+      return new Response(
+        storyHtml(id, {
+          complete: id === 1,
+          chapters: id === 3 ? chapterCountFor3 : 1,
+        }),
+      );
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  // Initial baseline fetch for stories 1 (Completed), 2 (Ongoing unchanged), 3 (Ongoing updated later).
+  await plugin.parseNovel('s/1/', 'background');
+  await plugin.parseNovel('s/2/', 'background');
+  await plugin.parseNovel('s/3/', 'background');
+  assert.deepEqual(storyRequests, [1, 2, 3]);
+  const baseline2FetchedAt = state.get('novel-baseline:2').value.fetchedAt;
+  const baseline3FetchedAt = state.get('novel-baseline:3').value.fetchedAt;
+
+  // 2 hours later, story 3 gets a second chapter.
+  storyRequests.length = 0;
+  accountRequests.length = 0;
+  time.now += 2 * 60 * 60_000;
+  chapterCountFor3 = 2;
+
+  const r1 = await plugin.parseNovel('s/1/', 'background');
+  const r2 = await plugin.parseNovel('s/2/', 'background');
+  const r3 = await plugin.parseNovel('s/3/', 'background');
+
+  assert.equal(r1.status, 'Completed');
+  assert.equal(r2.chapters.length, 1);
+  assert.equal(r3.chapters.length, 2);
+  // Only 1 account-list page request and 1 story request (story 3)!
+  assert.equal(accountRequests.length, 1);
+  assert.deepEqual(storyRequests, [3]);
+  // Story 2's stored fetchedAt was NOT bumped when returning cached chapters!
+  assert.equal(
+    state.get('novel-baseline:2').value.fetchedAt,
+    baseline2FetchedAt,
+  );
+  // Story 3's stored fetchedAt WAS updated to the new live fetch time!
+  assert.ok(state.get('novel-baseline:3').value.fetchedAt > baseline3FetchedAt);
+});
+
+test('backs off account-list delta lookups for signed-out users without hammering /alert/story.php', async () => {
+  const accountRequests = [];
+  const storyRequests = [];
+  const { plugin, time } = harness(async url => {
+    if (
+      url.includes('/alert/story.php') ||
+      url.includes('/favorites/story.php')
+    ) {
+      accountRequests.push(url);
+      return new Response('<html><body>Please sign in</body></html>');
+    }
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      storyRequests.push(Number(match[1]));
+      return new Response(storyHtml(match[1], { complete: false }));
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  // Baseline 3 ongoing stories first.
+  for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
+  storyRequests.length = 0;
+
+  // 2 hours later, batch update runs while signed out: should check /alert/story.php only ONCE.
+  time.now += 2 * 60 * 60_000;
+  for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
+  assert.equal(accountRequests.length, 1);
+  assert.deepEqual(storyRequests, [1, 2, 3]);
 });

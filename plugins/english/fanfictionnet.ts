@@ -75,18 +75,40 @@ const INDEX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LIST_TTL_MS = 15 * 60 * 1000;
 // Short, so library update checks still see new chapters.
 const NOVEL_TTL_MS = 10 * 60 * 1000;
+const BASELINE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const COMPLETED_RECHECK_MS = 30 * 24 * 60 * 60 * 1000;
 const CHAPTER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CHAPTER_CACHE_SIZE = 500;
 const ACCOUNT_PAGE_SIZE = 50;
 const ACCOUNT_PAGE_TTL_MS = 5 * 60 * 1000;
+const ACCOUNT_INDEX_TTL_MS = 30 * 60 * 1000;
+const ACCOUNT_STALE_MAX_AGE_MS = 30 * 60 * 1000;
+const ACCOUNT_INDEX_MAX_PAGES = 25;
+const ACCOUNT_UNAVAILABLE_TTL_MS = 15 * 60 * 1000;
 const STALE_BROWSE_TTL_MS = 24 * 60 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 25 * 1000;
+const INTERACTIVE_SPACING_MS = 300;
+const BATCH_SPACING_MIN_MS = 2500;
+const BATCH_SPACING_JITTER_MS = 1500;
+const BATCH_DETECT_WINDOW_MS = 5000;
+const STORY_BUDGET_MAX = 15;
+const STORY_BUDGET_WINDOW_MS = 15 * 60 * 1000;
+const MIN_PAUSE_MS = 60 * 1000;
+const MAX_PAUSE_MS = 30 * 60 * 1000;
+const CHALLENGE_BACKOFF_MS = [
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  30 * 60 * 1000,
+] as const;
 const SOURCE_PAUSE_KEY = 'source-request-pause';
+const STORY_BUDGET_KEY = 'story-fetch-budget';
 const ACCOUNT_LISTS = {
   favorites: '/favorites/story.php',
   follows: '/alert/story.php',
 } as const;
 
 type AccountList = keyof typeof ACCOUNT_LISTS;
+const ACCOUNT_LIST_ORDER: readonly AccountList[] = ['follows', 'favorites'];
 
 class AccountListError extends Error {
   constructor(message: string) {
@@ -99,28 +121,53 @@ class SourceUpdatePaused extends Error {
   constructor(
     message: string,
     readonly sourceId: string,
-    readonly retryAt: number | undefined,
+    readonly retryAt: number,
   ) {
     super(message);
     this.name = 'SourceUpdatePaused';
   }
 }
 
+type PauseRecord = {
+  readonly message: string;
+  readonly retryAt: number;
+  readonly strikes?: number;
+  readonly needsVerification?: boolean;
+};
+
+type NovelBaseline = {
+  readonly fetchedAt: number;
+  readonly novel: Plugin.SourceNovel;
+};
+
 type PageTicket = { priority: Plugin.RequestPriority };
+
+type FetchOptions = NonNullable<Parameters<typeof fetchLib.fetchApi>[1]>;
+type FetchSignal = FetchOptions['signal'];
 
 type PageRequest = {
   readonly ticket: PageTicket;
-  readonly run: () => Promise<string>;
+  readonly run: (signal?: FetchSignal) => Promise<string>;
   readonly resolve: (html: string) => void;
   readonly reject: (error: unknown) => void;
   readonly key: string;
 };
 
 type AccountPage = {
+  readonly accountId: string | undefined;
   readonly checkedAt: number;
   readonly novels: Plugin.NovelItem[];
   readonly updateDates: ReadonlyMap<string, number>;
   readonly next: boolean;
+};
+
+type AccountDeltaState = {
+  readonly startedAt: number;
+  readonly dates: Map<string, number>;
+  listIndex: number;
+  page: number;
+  pagesScanned: number;
+  done: boolean;
 };
 
 type BrowseCache<T> = {
@@ -254,8 +301,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.9.0';
-  supportsRequestPriority = true;
+  version = '1.10.0';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -537,54 +583,91 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return { ...this.requestStats };
   }
 
-  private readPause(): SourceUpdatePaused | undefined {
-    const record = storage.get<{ message: string; retryAt?: number }>(
-      SOURCE_PAUSE_KEY,
-    );
+  private readPauseRecord(): PauseRecord | undefined {
+    const record = storage.get<PauseRecord>(SOURCE_PAUSE_KEY);
     if (
       !record ||
-      (record.retryAt !== undefined && record.retryAt <= Date.now())
+      typeof record.retryAt !== 'number' ||
+      !Number.isFinite(record.retryAt)
     )
       return;
+    return record;
+  }
+
+  private readPause(): SourceUpdatePaused | undefined {
+    const record = this.readPauseRecord();
+    if (!record || record.retryAt <= Date.now()) return;
     return new SourceUpdatePaused(record.message, this.id, record.retryAt);
   }
 
-  getRequestPause() {
-    const pause = this.readPause();
-    if (pause)
-      return {
-        message: pause.message,
-        needsVerification: pause.retryAt === undefined,
-      };
+  private clearPause() {
+    storage.delete(SOURCE_PAUSE_KEY);
   }
 
   onSourceWebViewVerified() {
-    const pause = this.readPause();
-    if (pause && pause.retryAt === undefined) storage.delete(SOURCE_PAUSE_KEY);
-  }
-
-  promoteChapterRequest(chapterPath: string) {
-    const path = chapterPath.replace(/^\/+/, '');
-    const pending = this.inFlightPages.get(`public:${this.site}/${path}`);
-    if (pending) pending.ticket.priority = 'interactive';
+    const record = this.readPauseRecord();
+    if (record?.needsVerification) this.clearPause();
   }
 
   private pauseRequests(
     message: string,
     retryAfter: string | null | undefined,
+    needsVerification = false,
   ): never {
+    const existing = this.readPauseRecord();
+    const strikes = (existing?.strikes ?? 0) + 1;
     const seconds = Number(retryAfter);
     const date = retryAfter ? Date.parse(retryAfter) : NaN;
     const now = Date.now();
-    const delay =
+    const parsedDelay =
       seconds > 0 && Number.isFinite(seconds)
         ? seconds * 1000
         : Number.isFinite(date) && date > now
           ? date - now
-          : 60000;
-    const retryAt = retryAfter === undefined ? undefined : now + delay;
-    storage.set(SOURCE_PAUSE_KEY, { message, retryAt });
+          : undefined;
+    const backoff =
+      CHALLENGE_BACKOFF_MS[
+        Math.min(strikes - 1, CHALLENGE_BACKOFF_MS.length - 1)
+      ];
+    const delay =
+      parsedDelay !== undefined
+        ? Math.min(MAX_PAUSE_MS, Math.max(MIN_PAUSE_MS, parsedDelay))
+        : backoff;
+    const retryAt = now + delay;
+    storage.set<PauseRecord>(
+      SOURCE_PAUSE_KEY,
+      { message, retryAt, strikes, needsVerification },
+      now + MAX_PAUSE_MS * 2,
+    );
     throw new SourceUpdatePaused(message, this.id, retryAt);
+  }
+
+  private readStoryBudget(now: number): number[] {
+    const raw = storage.get<number[]>(STORY_BUDGET_KEY);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      ts =>
+        typeof ts === 'number' &&
+        ts <= now &&
+        now - ts < STORY_BUDGET_WINDOW_MS,
+    );
+  }
+
+  private assertStoryBudget(now: number) {
+    const recent = this.readStoryBudget(now);
+    if (recent.length >= STORY_BUDGET_MAX) {
+      const retryAt = recent[0] + STORY_BUDGET_WINDOW_MS;
+      throw new SourceUpdatePaused(
+        `FanFiction.Net paused after ${STORY_BUDGET_MAX} live story checks to protect your IP. Wait a few minutes before updating again.`,
+        this.id,
+        retryAt,
+      );
+    }
+  }
+
+  private recordStoryFetch(now: number) {
+    const next = [...this.readStoryBudget(now), now];
+    storage.set(STORY_BUDGET_KEY, next, now + STORY_BUDGET_WINDOW_MS);
   }
 
   private async getPage(
@@ -609,8 +692,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       this.pageQueue.push({
         key,
         ticket,
-        run: () =>
-          this.fetchPageHtml(url, waitForSelector, options?.account ?? false),
+        run: signal =>
+          this.fetchPageHtml(
+            url,
+            waitForSelector,
+            options?.account ?? false,
+            signal,
+          ),
         resolve,
         reject,
       });
@@ -627,20 +715,54 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return interactive < 0 ? 0 : interactive;
   }
 
+  private requestSpacing(priority: Plugin.RequestPriority): number {
+    if (priority === 'interactive') return INTERACTIVE_SPACING_MS;
+    return (
+      BATCH_SPACING_MIN_MS + Math.floor(Math.random() * BATCH_SPACING_JITTER_MS)
+    );
+  }
+
+  private async withTimeout<T>(
+    run: (signal?: FetchSignal) => Promise<T>,
+    timeoutMs: number,
+  ): Promise<T> {
+    const controller =
+      typeof AbortController === 'function' ? new AbortController() : undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller?.abort();
+        reject(new Error('FanFiction.Net request timed out.'));
+      }, timeoutMs);
+    });
+    const pending = run(controller?.signal);
+    pending.catch(() => undefined);
+    try {
+      return await Promise.race([pending, timeout]);
+    } finally {
+      if (timer !== undefined && typeof clearTimeout === 'function')
+        clearTimeout(timer);
+    }
+  }
+
   private async drainPages() {
     this.drainingPages = true;
     try {
       while (this.pageQueue.length) {
-        const next = this.pageQueue[this.nextPageRequest()];
+        const nextIndex = this.nextPageRequest();
+        const next = this.pageQueue[nextIndex];
         const pause = this.readPause();
         if (pause) {
-          this.pageQueue.splice(this.nextPageRequest(), 1);
+          this.pageQueue.splice(nextIndex, 1);
           this.inFlightPages.delete(next.key);
           next.reject(pause);
           continue;
         }
-        const spacing = next.ticket.priority === 'interactive' ? 250 : 1000;
-        const wait = this.lastRequestStart + spacing - Date.now();
+        const spacing = this.requestSpacing(next.ticket.priority);
+        const wait =
+          this.lastRequestStart > 0
+            ? this.lastRequestStart + spacing - Date.now()
+            : 0;
         if (wait > 0)
           await new Promise<void>(resolve => setTimeout(resolve, wait));
         const [task] = this.pageQueue.splice(this.nextPageRequest(), 1);
@@ -649,7 +771,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
           if (pendingPause) throw pendingPause;
           this.lastRequestStart = Date.now();
           this.requestStats.requests += 1;
-          task.resolve(await task.run());
+          task.resolve(await this.withTimeout(task.run, REQUEST_TIMEOUT_MS));
         } catch (error) {
           task.reject(error);
         } finally {
@@ -665,13 +787,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     url: string,
     waitForSelector: string,
     useWebViewSession: boolean,
+    signal?: FetchSignal,
   ): Promise<string> {
-    const res = await fetchLib.fetchApi(
-      url,
-      useWebViewSession
-        ? { credentials: 'include' }
-        : { headers: { 'User-Agent': DESKTOP_USER_AGENT } },
-    );
+    const init: FetchOptions = useWebViewSession
+      ? { credentials: 'include' }
+      : { headers: { 'User-Agent': DESKTOP_USER_AGENT } };
+    if (signal) init.signal = signal;
+    const res = await fetchLib.fetchApi(url, init);
     if (res.status === 429) {
       this.requestStats.throttled += 1;
       this.pauseRequests(
@@ -681,10 +803,11 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     }
     let html = await res.text();
 
-    if (
+    const isChallengeResponse =
       res.headers.get('cf-mitigated') === 'challenge' ||
-      this.isChallenge(html)
-    ) {
+      this.isChallenge(html) ||
+      (!useWebViewSession && res.status === 403);
+    if (isChallengeResponse) {
       this.requestStats.challenges += 1;
       const message =
         'FanFiction.Net needs verification. Open it in WebView to continue.';
@@ -692,7 +815,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         fetchLib as { fetchViaWebview?: FetchViaWebview }
       ).fetchViaWebview;
       if (typeof fetchViaWebview !== 'function')
-        this.pauseRequests(message, null);
+        this.pauseRequests(message, null, true);
       try {
         const rendered = await fetchViaWebview(url, {
           waitForSelector,
@@ -702,12 +825,12 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         if (rendered?.ok && rendered.html && !this.isChallenge(rendered.html)) {
           html = rendered.html;
         } else {
-          this.pauseRequests(message, undefined);
+          this.pauseRequests(message, null, true);
         }
       } catch (error) {
         if (!(error instanceof Error) || error.name === 'SourceUpdatePaused')
           throw error;
-        this.pauseRequests(message, undefined);
+        this.pauseRequests(message, null, true);
       }
     } else if (
       useWebViewSession &&
@@ -724,13 +847,19 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     } else if (!res.ok) {
       throw new Error(`FanFiction.Net returned ${res.status} for ${url}`);
     }
+    this.clearPause();
     return html;
   }
 
-  // Real pages also embed Cloudflare's passive bot script, so look for the interstitial itself.
+  // Real pages also embed Cloudflare's passive bot script, so look for challenges and block pages.
   private isChallenge(html: string): boolean {
     return (
-      /<title>\s*Just a moment/i.test(html) || html.includes('cf-chl-widget')
+      /<title>\s*Just a moment/i.test(html) ||
+      /Attention Required!\s*\|\s*Cloudflare/i.test(html) ||
+      /Sorry, you have been blocked/i.test(html) ||
+      html.includes('cf-chl-widget') ||
+      html.includes('cf-error-details') ||
+      html.includes('challenge-platform')
     );
   }
 
@@ -877,23 +1006,6 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return sections.length > 1 ? all.sort((x, y) => y.c - x.c) : all;
   }
 
-  /** Reads a value cached on the device, or loads and caches it. */
-  private async cached<T>(
-    key: string,
-    ttlMs: number,
-    load: () => Promise<T>,
-  ): Promise<T> {
-    this.pruneExpired();
-    const hit = (await storage.get(key)) as T | undefined;
-    if (hit !== undefined && hit !== null) {
-      this.requestStats.cacheHits += 1;
-      return hit;
-    }
-    const value = await load();
-    await storage.set(key, value, Date.now() + ttlMs);
-    return value;
-  }
-
   private async cachedBrowse<T>(
     key: string,
     load: () => Promise<T>,
@@ -934,7 +1046,8 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     this.pruned = true;
     try {
       for (const key of storage.getAllKeys()) {
-        if (!/^(list|search|novel|chapter):/.test(key)) continue;
+        if (!/^(browse|list|search|novel|novel-baseline|chapter):/.test(key))
+          continue;
         const entry = storage.get(key, true) as
           { expires?: number } | undefined;
         if (!entry || (entry.expires && entry.expires < Date.now()))
@@ -1073,48 +1186,97 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       : [{ label: 'Only for crossovers with a fandom', value: '' }];
   }
 
+  private activeAccountId: string | undefined;
   private readonly accountPages = new Map<string, AccountPage>();
+  private readonly accountPageNext = new Map<
+    string,
+    { readonly checkedAt: number; readonly next: boolean }
+  >();
+  private accountDelta: AccountDeltaState | undefined;
+  private accountUnavailableUntil = 0;
+
+  private clearAccountCache() {
+    this.activeAccountId = undefined;
+    this.accountPages.clear();
+    this.accountPageNext.clear();
+    this.accountDelta = undefined;
+  }
 
   private async browseAccountList(
     list: AccountList,
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
-    if (
-      pageNo > 1 &&
-      !(await this.accountPage(list, pageNo - 1, 'interactive')).next
-    )
-      return [];
+    if (pageNo > 1) {
+      const previous = this.accountPageNext.get(`${list}:${pageNo - 1}`);
+      const freshPrevious =
+        previous && Date.now() - previous.checkedAt < ACCOUNT_PAGE_TTL_MS
+          ? previous
+          : undefined;
+      if (freshPrevious && !freshPrevious.next) return [];
+      if (
+        !freshPrevious &&
+        !(await this.accountPage(list, pageNo - 1, 'interactive')).next
+      )
+        return [];
+    }
     return (await this.accountPage(list, pageNo, 'interactive')).novels;
   }
 
-  async getLibraryUpdateHints(
-    paths: readonly string[],
-  ): Promise<readonly Plugin.LibraryUpdateHint[]> {
-    const requested = new Set(paths);
-    const hints: Plugin.LibraryUpdateHint[] = [];
-    let remainingPages = Math.max(1, Math.floor(paths.length / 10));
-    try {
-      for (const list of ['follows', 'favorites'] as const) {
-        let next = true;
-        for (
-          let page = 1;
-          next && requested.size && remainingPages > 0;
-          page += 1
-        ) {
-          remainingPages -= 1;
-          const result = await this.accountPage(list, page, 'background');
-          next = result.next;
-          result.updateDates.forEach((updatedBefore, path) => {
-            if (requested.delete(path)) hints.push({ path, updatedBefore });
-          });
-        }
-        if (requested.size <= 1) break;
-      }
-    } catch (error) {
-      if (!(error instanceof Error) || error.name !== 'AccountListError')
-        throw error;
+  private async lookupAccountUpdateDate(
+    storyPath: string,
+  ): Promise<number | undefined> {
+    const now = Date.now();
+    if (now < this.accountUnavailableUntil) return;
+    if (
+      !this.accountDelta ||
+      now - this.accountDelta.startedAt > ACCOUNT_INDEX_TTL_MS
+    ) {
+      this.accountDelta = {
+        startedAt: now,
+        dates: new Map<string, number>(),
+        listIndex: 0,
+        page: 1,
+        pagesScanned: 0,
+        done: false,
+      };
     }
-    return hints;
+    const delta = this.accountDelta;
+    if (delta.dates.has(storyPath)) return delta.dates.get(storyPath);
+    if (delta.done) return;
+
+    try {
+      while (
+        !delta.done &&
+        delta.pagesScanned < ACCOUNT_INDEX_MAX_PAGES &&
+        delta.listIndex < ACCOUNT_LIST_ORDER.length
+      ) {
+        const list = ACCOUNT_LIST_ORDER[delta.listIndex];
+        const page = delta.page;
+        delta.pagesScanned += 1;
+        const result = await this.accountPage(list, page, 'background');
+        result.updateDates.forEach((updatedBefore, path) => {
+          const existing = delta.dates.get(path);
+          if (existing === undefined || updatedBefore > existing)
+            delta.dates.set(path, updatedBefore);
+        });
+        if (result.next) {
+          delta.page += 1;
+        } else {
+          delta.listIndex += 1;
+          delta.page = 1;
+          if (delta.listIndex >= ACCOUNT_LIST_ORDER.length) delta.done = true;
+        }
+        if (delta.dates.has(storyPath)) return delta.dates.get(storyPath);
+      }
+      if (delta.pagesScanned >= ACCOUNT_INDEX_MAX_PAGES) delta.done = true;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AccountListError') {
+        this.accountUnavailableUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
+        return;
+      }
+      throw error;
+    }
+    return delta.dates.get(storyPath);
   }
 
   private listingUpdateUpperBound(text: string): number | undefined {
@@ -1131,13 +1293,60 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return start + 2 * 24 * 60 * 60 * 1000;
   }
 
+  private extractAccountId($: CheerioAPI): string | undefined {
+    const scriptId = $.html().match(
+      /(?:var|let|const)?\s*userid\s*=\s*['"]?([1-9]\d*)['"]?/i,
+    )?.[1];
+    if (scriptId) return `uid:${scriptId}`;
+
+    const attrId = (
+      $('meta[name="userid"]').attr('content') ||
+      $('[data-userid]').first().attr('data-userid') ||
+      ''
+    ).trim();
+    if (/^[1-9]\d*$/.test(attrId)) return `uid:${attrId}`;
+
+    const chromeLinks = $('a[href]').filter(
+      (_, element) => !$(element).closest('table').length,
+    );
+    let profileId: string | undefined;
+    let accountName: string | undefined;
+    chromeLinks.each((_, element) => {
+      if (profileId) return;
+      const link = $(element);
+      const href = (link.attr('href') ?? '').replace(
+        /^https?:\/\/www\.fanfiction\.net(?=\/)/i,
+        '',
+      );
+      const userMatch = href.match(/^\/u\/([1-9]\d*)(?:\/|$)/i);
+      if (userMatch) {
+        profileId = `u:${userMatch[1]}`;
+        return;
+      }
+      if (!accountName && /\/account\/(?:settings|profile)\.php/i.test(href)) {
+        const label = link.text().trim();
+        if (
+          label &&
+          !/^(?:account|settings|profile|my account|log\s*out|logout|sign\s*out)$/i.test(
+            label,
+          )
+        ) {
+          accountName = `name:${label.toLowerCase()}`;
+        }
+      }
+    });
+    return profileId ?? accountName;
+  }
+
   private async accountPage(
     list: AccountList,
     pageNo: number,
     priority: Plugin.RequestPriority,
   ): Promise<AccountPage> {
-    const key = `${list}:${pageNo}`;
-    const cached = this.accountPages.get(key);
+    const accountId = this.activeAccountId;
+    const cached = accountId
+      ? this.accountPages.get(`${accountId}:${list}:${pageNo}`)
+      : undefined;
     if (cached && Date.now() - cached.checkedAt < ACCOUNT_PAGE_TTL_MS) {
       this.requestStats.cacheHits += 1;
       return cached;
@@ -1147,17 +1356,34 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       const url = `${this.site}${path}${pageNo === 1 ? '' : `?p=${pageNo}`}`;
       const $ = await this.getPage(url, 'body', { account: true, priority });
       const result = this.parseAccountPage($, path, pageNo);
-      this.accountPages.set(key, result);
+      if (result.accountId) {
+        if (
+          this.activeAccountId !== undefined &&
+          this.activeAccountId !== result.accountId
+        ) {
+          this.clearAccountCache();
+        }
+        this.activeAccountId = result.accountId;
+        this.accountPages.set(`${result.accountId}:${list}:${pageNo}`, result);
+      } else {
+        this.clearAccountCache();
+      }
+      this.accountPageNext.set(`${list}:${pageNo}`, {
+        checkedAt: result.checkedAt,
+        next: result.next,
+      });
       return result;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
-      if (error.name === 'AccountListError') this.accountPages.clear();
-      if (
-        !cached ||
-        priority === 'background' ||
-        error.name !== 'SourceUpdatePaused'
-      )
-        throw error;
+      if (error.name === 'AccountListError') this.clearAccountCache();
+      const canServeStale =
+        priority !== 'background' &&
+        error.name === 'SourceUpdatePaused' &&
+        this.activeAccountId !== undefined &&
+        cached !== undefined &&
+        cached.accountId === this.activeAccountId &&
+        Date.now() - cached.checkedAt <= ACCOUNT_STALE_MAX_AGE_MS;
+      if (!canServeStale) throw error;
       this.requestStats.staleHits += 1;
       return cached;
     }
@@ -1173,6 +1399,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         'Sign in to FanFiction.Net using the globe above, then return here and tap Retry.',
       );
     }
+    const accountId = this.extractAccountId($);
     const novels = new Map<string, Plugin.NovelItem>();
     const updateDates = new Map<string, number>();
     let next = false;
@@ -1232,6 +1459,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       );
     }
     return {
+      accountId,
       checkedAt: Date.now(),
       novels: Array.from(novels.values()),
       updateDates,
@@ -1347,22 +1575,85 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     );
   }
 
+  private lastParseNovelAt = 0;
+  private lastParseNovelId: string | undefined;
+
+  private resolveNovelPriority(
+    id: string,
+    explicitPriority?: Plugin.RequestPriority,
+  ): Plugin.RequestPriority {
+    if (explicitPriority) return explicitPriority;
+    const now = Date.now();
+    const isBatch =
+      this.lastParseNovelId !== undefined &&
+      this.lastParseNovelId !== id &&
+      now - this.lastParseNovelAt <= BATCH_DETECT_WINDOW_MS;
+    return isBatch ? 'background' : 'interactive';
+  }
+
   async parseNovel(
     novelPath: string,
-    priority?: Plugin.RequestPriority,
+    explicitPriority?: Plugin.RequestPriority,
   ): Promise<Plugin.SourceNovel> {
     const id = this.storyId('/' + novelPath);
     if (!id) throw new Error(`Not a FanFiction.Net story path: ${novelPath}`);
-    return this.cached(`novel:${id}`, NOVEL_TTL_MS, async () => {
-      const $ = await this.getPage(`${this.site}/s/${id}/1/`, '#profile_top', {
-        priority,
-      });
+    const storyPath = `s/${id}/`;
+    const priority = this.resolveNovelPriority(id, explicitPriority);
+    this.lastParseNovelAt = Date.now();
+    this.lastParseNovelId = id;
+    try {
+      this.pruneExpired();
+      const baseline = storage.get<NovelBaseline>(`novel-baseline:${id}`);
+      const now = Date.now();
+      if (baseline && now - baseline.fetchedAt < NOVEL_TTL_MS) {
+        this.requestStats.cacheHits += 1;
+        return baseline.novel;
+      }
+
+      if (priority === 'background' && baseline) {
+        if (
+          baseline.novel.status === NovelStatus.Completed &&
+          now - baseline.fetchedAt < COMPLETED_RECHECK_MS
+        ) {
+          this.requestStats.cacheHits += 1;
+          return baseline.novel;
+        }
+        const updatedBefore = await this.lookupAccountUpdateDate(storyPath);
+        if (
+          updatedBefore !== undefined &&
+          updatedBefore <= baseline.fetchedAt
+        ) {
+          this.requestStats.cacheHits += 1;
+          return baseline.novel;
+        }
+      }
+
+      const pause = this.readPause();
+      if (pause) throw pause;
+
+      const url = `${this.site}/s/${id}/1/`;
+      const coalesced = this.inFlightPages.has(`public:${url}`);
+      if (!coalesced) {
+        if (priority === 'background') this.assertStoryBudget(Date.now());
+        this.recordStoryFetch(Date.now());
+      }
+
+      const $ = await this.getPage(url, '#profile_top', { priority });
       const novel = this.novelFromPage($, id);
+      const fetchedAt = Date.now();
+      storage.set<NovelBaseline>(
+        `novel-baseline:${id}`,
+        { fetchedAt, novel },
+        fetchedAt + BASELINE_TTL_MS,
+      );
       // The story page is chapter 1, so reading it later costs no request.
       const first = this.chapterText($);
       if (first) await this.cacheChapter(`s/${id}/1/`, first);
       return novel;
-    });
+    } finally {
+      this.lastParseNovelAt = Date.now();
+      this.lastParseNovelId = id;
+    }
   }
 
   private novelFromPage($: CheerioAPI, id: string): Plugin.SourceNovel {
