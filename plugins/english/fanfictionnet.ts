@@ -213,7 +213,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.7.0';
+  version = '1.7.1';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -790,12 +790,12 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   private filterPickerData($: CheerioAPI): FilterPickerData {
     const options = (select: string) =>
       $(`select[name=${select}] option`)
-        .map((_, option): [string, string] => [
+        .toArray()
+        .map((option): [string, string] => [
           $(option).text().trim(),
           $(option).attr('value') || '0',
         ])
-        .get()
-        .filter(([, id]) => id !== '0') as [string, string][];
+        .filter(([, id]) => id !== '0');
     return {
       characters: options('characterid1'),
       worlds: options('verseid1'),

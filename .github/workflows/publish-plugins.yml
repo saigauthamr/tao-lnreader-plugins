@@ -24,16 +24,14 @@ jobs:
           node-version: '24'
 
       - name: Install dependencies
-        run: npx --yes pnpm@12.21.0 install --frozen-lockfile --prod --ignore-scripts
+        run: npx --yes pnpm@12.21.0 install --frozen-lockfile --ignore-scripts
 
       - name: Build and publish
         env:
           BRANCH: plugins/v3.0.0
         shell: bash
         run: |
-          npm run build:compile
-          npm run build:manifest
-          node scripts/copy-legacy-plugin-path.js
+          npm run build
           jq -e 'length == 1 and .[0].id == "fanfictionnet"' .dist/plugins.min.json
 
           git config user.name saigauthamr
@@ -46,14 +44,14 @@ jobs:
             git -C "$publish_dir" switch --orphan "$BRANCH"
           fi
 
-          cp -R .dist .js/src/plugins public total.svg "$RUNNER_TEMP/"
-          mkdir -p "$publish_dir/.js/src"
-          rsync -a --delete "$RUNNER_TEMP/.dist/" "$publish_dir/.dist/"
-          rsync -a --delete "$RUNNER_TEMP/plugins/" "$publish_dir/.js/src/plugins/"
-          rsync -a --delete "$RUNNER_TEMP/public/" "$publish_dir/public/"
-          cp "$RUNNER_TEMP/total.svg" "$publish_dir/total.svg"
+          mkdir -p "$publish_dir/.dist" "$publish_dir/.js/src/plugins" "$publish_dir/public"
+          rsync -ac --delete .dist/ "$publish_dir/.dist/"
+          rsync -ac --delete .js/src/plugins/ "$publish_dir/.js/src/plugins/"
+          rsync -ac --delete public/ "$publish_dir/public/"
+          cmp .dist/plugins.min.json "$publish_dir/.dist/plugins.min.json"
           cd "$publish_dir"
-          git add -Af -- .dist .js/src/plugins public total.svg
+          git rm --ignore-unmatch total.svg
+          git add -Af -- .dist .js/src/plugins public
           if ! git diff --cached --quiet; then
             git commit -m "chore: publish FanFiction.Net plugin"
             git push origin "HEAD:refs/heads/$BRANCH"
