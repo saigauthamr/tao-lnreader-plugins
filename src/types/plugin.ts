@@ -68,6 +68,13 @@ export namespace Plugin {
     body?: string;
   };
 
+  export type RequestPriority = 'interactive' | 'background';
+
+  export type LibraryUpdateHint = {
+    readonly path: string;
+    readonly updatedBefore: number;
+  };
+
   export type PluginBase = {
     id: string;
     name: string;
@@ -95,9 +102,18 @@ export namespace Plugin {
      * @param novelPath
      * @returns novel metadata and its first page
      */
-    parseNovel(novelPath: string): Promise<SourceNovel>;
-    parseChapter(chapterPath: string): Promise<string>;
+    parseNovel(
+      novelPath: string,
+      priority?: RequestPriority,
+    ): Promise<SourceNovel>;
+    parseChapter(
+      chapterPath: string,
+      priority?: RequestPriority,
+    ): Promise<string>;
     searchNovels(searchTerm: string, pageNo: number): Promise<NovelItem[]>;
+    getLibraryUpdateHints?(
+      paths: readonly string[],
+    ): Promise<readonly LibraryUpdateHint[]>;
     resolveUrl?(path: string, isNovel?: boolean): string;
   };
 

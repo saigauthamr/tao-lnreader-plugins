@@ -32,6 +32,7 @@ jobs:
         shell: bash
         run: |
           npm run build
+          npm test
           jq -e 'length == 1 and .[0].id == "fanfictionnet"' .dist/plugins.min.json
 
           git config user.name saigauthamr

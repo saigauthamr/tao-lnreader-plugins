@@ -5,6 +5,7 @@
   "scripts": {
     "build": "tsc && node scripts/build-plugin-manifest.js",
     "serve:dev": "tsc && node --env-file=.env scripts/build-plugin-manifest.js && serve",
+    "test": "node --test scripts/test-fanfictionnet-network.js",
     "lint": "eslint plugins/english/fanfictionnet.ts scripts/build-plugin-manifest.js"
   },
   "dependencies": {
