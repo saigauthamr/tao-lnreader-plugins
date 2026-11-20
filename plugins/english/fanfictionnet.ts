@@ -301,7 +301,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.10.0';
+  version = '1.10.1';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -783,17 +783,44 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     }
   }
 
+  private mobileFallbackUrl(url: string): string {
+    if (url.includes('/favorites/story.php'))
+      return url.replace(
+        /^https?:\/\/www\.fanfiction\.net\/favorites\/story\.php/i,
+        'https://m.fanfiction.net/m/f_story.php',
+      );
+    if (url.includes('/alert/story.php'))
+      return url.replace(
+        /^https?:\/\/www\.fanfiction\.net\/alert\/story\.php/i,
+        'https://m.fanfiction.net/m/a_story.php',
+      );
+    return url;
+  }
+
+  private isChallengeResponse(
+    res: Response,
+    html: string,
+    useWebViewSession: boolean,
+  ): boolean {
+    return (
+      res.headers.get('cf-mitigated') === 'challenge' ||
+      this.isChallenge(html) ||
+      (!useWebViewSession && res.status === 403)
+    );
+  }
+
   private async fetchPageHtml(
     url: string,
     waitForSelector: string,
     useWebViewSession: boolean,
     signal?: FetchSignal,
   ): Promise<string> {
-    const init: FetchOptions = useWebViewSession
-      ? { credentials: 'include' }
-      : { headers: { 'User-Agent': DESKTOP_USER_AGENT } };
-    if (signal) init.signal = signal;
-    const res = await fetchLib.fetchApi(url, init);
+    const desktopInit: FetchOptions = {
+      credentials: 'include',
+      headers: { 'User-Agent': DESKTOP_USER_AGENT },
+    };
+    if (signal) desktopInit.signal = signal;
+    let res = await fetchLib.fetchApi(url, desktopInit);
     if (res.status === 429) {
       this.requestStats.throttled += 1;
       this.pauseRequests(
@@ -803,11 +830,30 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     }
     let html = await res.text();
 
-    const isChallengeResponse =
-      res.headers.get('cf-mitigated') === 'challenge' ||
-      this.isChallenge(html) ||
-      (!useWebViewSession && res.status === 403);
-    if (isChallengeResponse) {
+    // If desktop UA hits Cloudflare, retry once with WebView's native UA + cookies so solved cf_clearance applies.
+    if (this.isChallengeResponse(res, html, useWebViewSession)) {
+      const nativeInit: FetchOptions = { credentials: 'include' };
+      if (signal) nativeInit.signal = signal;
+      const fallbackUrl = this.mobileFallbackUrl(url);
+      const fallbackRes = await fetchLib.fetchApi(fallbackUrl, nativeInit);
+      if (fallbackRes.status === 429) {
+        this.requestStats.throttled += 1;
+        this.pauseRequests(
+          'FanFiction.Net is limiting requests. Wait before retrying.',
+          fallbackRes.headers.get('Retry-After'),
+        );
+      }
+      const fallbackHtml = await fallbackRes.text();
+      if (
+        fallbackRes.ok &&
+        !this.isChallengeResponse(fallbackRes, fallbackHtml, useWebViewSession)
+      ) {
+        res = fallbackRes;
+        html = fallbackHtml;
+      }
+    }
+
+    if (this.isChallengeResponse(res, html, useWebViewSession)) {
       this.requestStats.challenges += 1;
       const message =
         'FanFiction.Net needs verification. Open it in WebView to continue.';
@@ -851,15 +897,14 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return html;
   }
 
-  // Real pages also embed Cloudflare's passive bot script, so look for challenges and block pages.
+  // Real pages embed /cdn-cgi/challenge-platform/scripts/jsd/main.js passively, so match interstitials only.
   private isChallenge(html: string): boolean {
     return (
       /<title>\s*Just a moment/i.test(html) ||
       /Attention Required!\s*\|\s*Cloudflare/i.test(html) ||
       /Sorry, you have been blocked/i.test(html) ||
       html.includes('cf-chl-widget') ||
-      html.includes('cf-error-details') ||
-      html.includes('challenge-platform')
+      html.includes('cf-error-details')
     );
   }
 
@@ -909,7 +954,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return meta;
   }
 
-  /** Story list items of archive and search pages. */
+  /** Story list items of archive and search pages (desktop and mobile). */
   private parseList($: CheerioAPI): Plugin.NovelItem[] {
     const novels: Plugin.NovelItem[] = [];
     $('div.z-list').each((_, element) => {
@@ -924,6 +969,17 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
           image.attr('data-original') || image.attr('src'),
           180,
         ),
+      });
+    });
+    if (novels.length) return novels;
+    $('div.bs').each((_, element) => {
+      const link = $(element).find('a[href*="/s/"]').first();
+      const id = this.storyId(link.attr('href'));
+      if (!id) return;
+      novels.push({
+        name: link.text().trim() || 'Untitled',
+        path: `s/${id}/`,
+        cover: defaultCover,
       });
     });
     return novels;
@@ -1072,7 +1128,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   }
 
   private chapterText($: CheerioAPI): string | undefined {
-    const text = $('#storytext');
+    const text = $('#storytext').length ? $('#storytext') : $('#storycontent');
     if (!text.length) return undefined;
     text.find('div.google-auto-placed, script').remove();
     return text.html() || undefined;
@@ -1656,10 +1712,54 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     }
   }
 
+  private mobileNovelFromPage($: CheerioAPI, id: string): Plugin.SourceNovel {
+    const content = $('#content');
+    const header = content.find('div[align="center"]').first();
+    const title = header.find('b').first().text().trim();
+    if (!title) throw new Error('Story not found. It may have been deleted.');
+    const author =
+      header.find('a[href^="/u/"]').first().text().trim() || undefined;
+    const fandoms = content
+      .children('a[href]')
+      .map((_, a) => $(a).text().trim())
+      .get()
+      .slice(-1)
+      .flatMap(text => text.replace(/ Crossover$/, '').split(' + '))
+      .filter(Boolean);
+    const complete = $('img[src*="script-attribute-c"]').length > 0;
+    const html = $.html();
+    const chsMatch =
+      html.match(/\bvar\s+chs\s*=\s*(\d+)/) ||
+      html.match(/Ch\s+\d+\s+of\s+<a[^>]+>(\d+)<\/a>/i);
+    const chapterCount = Math.max(1, Number(chsMatch?.[1] || 1));
+    const chapters: Plugin.ChapterItem[] = [];
+    for (let number = 1; number <= chapterCount; number += 1) {
+      chapters.push({
+        name: chapterCount === 1 ? title : `Chapter ${number}`,
+        path: `s/${id}/${number}/`,
+        chapterNumber: number,
+      });
+    }
+    return {
+      path: `s/${id}/`,
+      name: title,
+      author,
+      genres: fandoms.join(', ') || undefined,
+      status: complete ? NovelStatus.Completed : NovelStatus.Ongoing,
+      chapters,
+    };
+  }
+
   private novelFromPage($: CheerioAPI, id: string): Plugin.SourceNovel {
     const profile = $('#profile_top');
-    if (!profile.length)
+    if (!profile.length) {
+      if (
+        $('#storycontent').length ||
+        $('#content div[align="center"] b').length
+      )
+        return this.mobileNovelFromPage($, id);
       throw new Error('Story not found. It may have been deleted.');
+    }
 
     const meta = this.parseMeta(profile.find('span.xgray').first().text());
     const fandoms = $('#pre_story_links a')

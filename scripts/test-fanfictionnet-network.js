@@ -195,7 +195,7 @@ test('opens one account page, reuses it during a challenge within stale cap, and
   await assert.rejects(plugin.parseChapter('s/1/1/'), {
     name: 'SourceUpdatePaused',
   });
-  assert.equal(requests.length, 3);
+  assert.equal(requests.length, 4);
   assert.equal(plugin.getRequestDiagnostics().staleHits, 1);
 
   // Past 30-minute stale cap: withholds stale private page during challenge.
@@ -203,7 +203,7 @@ test('opens one account page, reuses it during a challenge within stale cap, and
   await assert.rejects(plugin.popularNovels(1, options), {
     name: 'SourceUpdatePaused',
   });
-  assert.equal(requests.length, 4);
+  assert.equal(requests.length, 6);
 });
 
 test('isolates private account cache on Account A -> Account B switch and logout followed by challenge', async () => {
@@ -368,7 +368,7 @@ test('uses bounded exponential backoff on challenges and deny-list 403s, and rec
   await assert.rejects(next.plugin.parseChapter('s/2/1/'), {
     name: 'SourceUpdatePaused',
   });
-  assert.equal(requests, 2);
+  assert.equal(requests, 3);
 
   // Strike 2 after 5m cooldown using a 403 Cloudflare deny-list page -> escalates to 15m.
   next.time.now = first.time.now + 5 * 60_000 + 1;
@@ -378,7 +378,7 @@ test('uses bounded exponential backoff on challenges and deny-list 403s, and rec
     assert.equal(err.retryAt - next.time.now, 15 * 60_000);
     return true;
   });
-  assert.equal(requests, 3);
+  assert.equal(requests, 5);
 
   // Strike 3 after 15m cooldown -> caps at 30m.
   next.time.now += 15 * 60_000 + 1;
@@ -387,13 +387,13 @@ test('uses bounded exponential backoff on challenges and deny-list 403s, and rec
     assert.equal(err.retryAt - next.time.now, 30 * 60_000);
     return true;
   });
-  assert.equal(requests, 4);
+  assert.equal(requests, 7);
 
   // After 30m cooldown, clean response clears pause and resets strike count.
   next.time.now += 30 * 60_000 + 1;
   responseMode = 'ok';
   assert.match(await next.plugin.parseChapter('s/2/1/'), /Chapter text/);
-  assert.equal(requests, 5);
+  assert.equal(requests, 8);
 
   // Next challenge starts back at 5m (strike 1), not 30m.
   responseMode = 'challenge';
@@ -560,4 +560,61 @@ test('backs off account-list delta lookups for signed-out users without hammerin
   for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
   assert.equal(accountRequests.length, 1);
   assert.deepEqual(storyRequests, [1, 2, 3]);
+});
+
+test('does not false-positive on Cloudflare passive jsd challenge-platform script in 200 OK pages', async () => {
+  const seenInits = [];
+  const passiveBeacon =
+    "<script>var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=abc';</script>";
+  const { plugin } = harness(async (url, init) => {
+    seenInits.push({ url, init });
+    if (url.includes('/favorites/story.php')) {
+      return new Response(accountPage(1, 2, 2) + passiveBeacon);
+    }
+    return new Response(storyHtml(42, { chapters: 3 }) + passiveBeacon);
+  });
+
+  const novel = await plugin.parseNovel('s/42/');
+  assert.equal(novel.name, 'Story 42');
+  assert.equal(novel.chapters.length, 3);
+  assert.equal(plugin.getRequestDiagnostics().challenges, 0);
+
+  // Account list sends both credentials: 'include' and desktop User-Agent (avoids mobile 404 redirect).
+  const favs = await plugin.popularNovels(1, {
+    filters: { list: { value: 'favorites' } },
+  });
+  assert.equal(favs.length, 2);
+  const favReq = seenInits.find(r => r.url.includes('/favorites/story.php'));
+  assert.equal(favReq.init.credentials, 'include');
+  assert.ok(favReq.init.headers?.['User-Agent']);
+});
+
+test('falls back to WebView native UA and parses m.fanfiction.net HTML when desktop UA is challenged', async () => {
+  const mobileStory =
+    '<div id="content"><div align="center"><b>Mobile Story</b> by <a href="/u/7/">AuthorM</a></div>' +
+    '<a href="/book/">Books</a> » <a href="/book/Harry-Potter/">Harry Potter</a>' +
+    '<img class="mt icons" src="//ff77.b-cdn.net/static/fcons/script-attribute-c.png"/></div>' +
+    '<div id="storycontent"><p>Mobile chapter 1</p></div>' +
+    '<script>var chs = 4;</script>';
+  const mobileSearch =
+    '<div class="bs brb"><a href="/s/77/1/Test"><b>Mobile Hit</b></a> by <a href="/u/7/">AuthorM</a></div>';
+
+  const { plugin } = harness(async (url, init) => {
+    if (init?.headers?.['User-Agent']) return challenge();
+    assert.equal(init?.credentials, 'include');
+    if (url.includes('/search/')) return new Response(mobileSearch);
+    return new Response(mobileStory);
+  });
+
+  const novel = await plugin.parseNovel('s/77/');
+  assert.equal(novel.name, 'Mobile Story');
+  assert.equal(novel.author, 'AuthorM');
+  assert.equal(novel.status, 'Completed');
+  assert.equal(novel.chapters.length, 4);
+  assert.match(await plugin.parseChapter('s/77/1/'), /Mobile chapter 1/);
+
+  const hits = await plugin.searchNovels('test', 1);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].path, 's/77/');
+  assert.equal(hits[0].name, 'Mobile Hit');
 });
