@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 SITE = "https://www.fanfiction.net"
 PLUGIN_ID = "fanfictionnet"
+DEFAULT_CATEGORY_ID = 1
 LIST_PATHS = ("/favorites/story.php", "/alert/story.php")
 STORY_PATH = re.compile(r"^/?s/(\d+)(?:/|$)")
 EMPTY_LIST = re.compile(
@@ -140,7 +141,13 @@ def write_import(output: Path, stories: list[Story]) -> None:
     }
     with ZipFile(output, "x", compression=ZIP_DEFLATED) as backup:
         backup.writestr("Version.json", json.dumps(manifest))
-        backup.writestr("Category.json", "[]")
+        category = {
+            "id": DEFAULT_CATEGORY_ID,
+            "name": "Default",
+            "sort": 1,
+            "novelIds": [story.id for story in stories],
+        }
+        backup.writestr("Category.json", json.dumps([category]))
         for story in stories:
             entry = {
                 "id": story.id,
