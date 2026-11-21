@@ -736,3 +736,85 @@ test('uses signed-in account list dates on cold-start migrated stories without l
   // Only story 3 triggered a live fetch!
   assert.deepEqual(storyRequests, [3]);
 });
+
+test('checkLibraryUpdates filters signed-in migrated library using DB lastUpdatedAt in one scan', async () => {
+  const accountRequests = [];
+  let updatedMap = {
+    1: '05-01-2025', // unchanged old migrated fic
+    2: '11-21-2026', // updated today (newer than DB lastUpdatedAt)
+    3: '10-15-2026', // unchanged migrated fic matching DB date
+  };
+  const { plugin, time } = harness(async url => {
+    if (url.includes('/alert/story.php')) {
+      accountRequests.push(url);
+      return new Response(
+        accountPage(1, 3, 3, undefined, {
+          listLabel: 'Stories you are following',
+          updated: id => updatedMap[id] ?? '05-01-2025',
+        }),
+      );
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/2/', name: 'Story 2', lastUpdatedAt: '2026-10-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/3/', name: 'Story 3', lastUpdatedAt: '2026-10-15 08:00:00', status: 'Ongoing' },
+  ];
+
+  const toUpdate = await plugin.checkLibraryUpdates(candidates);
+  assert.deepEqual(Array.from(toUpdate), ['s/2/']);
+  assert.equal(accountRequests.length, 1);
+
+  // Next day: story 3 updates!
+  time.now += 24 * 60 * 60_000;
+  updatedMap = { 1: '05-01-2025', 2: '11-21-2026', 3: '11-22-2026' };
+  const nextUpdate = await plugin.checkLibraryUpdates([
+    candidates[0],
+    { ...candidates[1], lastUpdatedAt: '2026-11-21T12:00:00.000Z' },
+    candidates[2],
+  ]);
+  assert.ok(nextUpdate.includes('s/3/'));
+  assert.ok(!nextUpdate.includes('s/1/'));
+});
+
+test('checkLibraryUpdates returns undefined when signed out and isBackground object throws SourceUpdatePaused directly', async () => {
+  const storyRequests = [];
+  const { plugin, time } = harness(async url => {
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      storyRequests.push(Number(match[1]));
+      return new Response(storyHtml(match[1], { complete: false }));
+    }
+    return new Response('<html><body>Sign in</body></html>');
+  });
+
+  const batchResult = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', status: 'Ongoing' },
+  ]);
+  assert.equal(batchResult, undefined);
+
+  // Pause-aware host passes { isBackground: true } -> throws SourceUpdatePaused at #16 directly
+  // and does NOT lock stories #1..#15 behind the 12h fallback cooldown on the next window.
+  let pausedAt;
+  for (let id = 1; id <= 20; id += 1) {
+    try {
+      await plugin.parseNovel(`s/${id}/`, { isBackground: true });
+      time.now += 1000;
+    } catch (error) {
+      assert.equal(error.name, 'SourceUpdatePaused');
+      pausedAt = id;
+      break;
+    }
+  }
+  assert.equal(pausedAt, 16);
+  assert.equal(storyRequests.length, 15);
+
+  // 16 minutes later (past 10-min NOVEL_TTL_MS, well within 12h): story #1 can be checked again immediately
+  // if a small category finishes rotating!
+  storyRequests.length = 0;
+  time.now += 16 * 60_000;
+  await plugin.parseNovel('s/1/', { isBackground: true });
+  assert.deepEqual(storyRequests, [1]);
+});
