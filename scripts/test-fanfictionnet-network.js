@@ -818,3 +818,138 @@ test('checkLibraryUpdates returns undefined when signed out and isBackground obj
   await plugin.parseNovel('s/1/', { isBackground: true });
   assert.deepEqual(storyRequests, [1]);
 });
+
+test('checkLibraryUpdates scans each page at most once when accountId is missing and reports progress', async () => {
+  const accountRequests = [];
+  const progressMessages = [];
+  const { plugin } = harness(async url => {
+    accountRequests.push(url);
+    if (url.includes('/alert/story.php?p=2')) {
+      return new Response(
+        accountPage(51, 60, 60, undefined, {
+          accountId: '',
+          listLabel: 'Stories you are following',
+          updated: id => (id === 55 ? '11-21-2026' : '05-01-2025'),
+        }),
+      );
+    }
+    if (url.includes('/alert/story.php')) {
+      return new Response(
+        accountPage(1, 50, 60, 2, {
+          accountId: '',
+          listLabel: 'Stories you are following',
+          updated: '05-01-2025',
+        }),
+      );
+    }
+    if (url.includes('/favorites/story.php')) {
+      return new Response(
+        accountPage(1, 1, 1, undefined, {
+          accountId: '',
+          listLabel: 'Favorite Stories',
+          updated: '05-01-2025',
+        }),
+      );
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  // Include a story (999) absent from Alerts/Favorites so the scan runs through all lists.
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/2/', name: 'Story 2', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/55/', name: 'Story 55', lastUpdatedAt: '2026-10-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/999/', name: 'Story 999', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+  ];
+
+  const toUpdate = await plugin.checkLibraryUpdates(candidates, {
+    onProgress: msg => progressMessages.push(msg),
+  });
+  assert.deepEqual(Array.from(toUpdate), ['s/55/', 's/999/']);
+  // Exactly 3 pages fetched total (Alerts p1, Alerts p2, Favorites p1) — never restarted per candidate!
+  assert.equal(accountRequests.length, 3);
+  assert.deepEqual(progressMessages, [
+    'FanFiction.Net: scanning Story Alerts (page 1)',
+    'FanFiction.Net: scanning Story Alerts (page 2)',
+    'FanFiction.Net: scanning Favorites (page 1)',
+  ]);
+});
+
+test('checkLibraryUpdates parses mobile fallback account pages and skips lists without dates after page 1', async () => {
+  const requests = [];
+  const { plugin } = harness(async (url, init) => {
+    requests.push({ url, ua: init?.headers?.['User-Agent'] });
+    // Simulate Cloudflare challenging desktop UA on www.fanfiction.net.
+    if (url.includes('www.fanfiction.net')) {
+      return challenge();
+    }
+    if (url.includes('m.fanfiction.net/m/a_story.php?p=2')) {
+      return new Response(`<html><body>
+        <a href="/logout.php">Logout</a>
+        <div class="bs"><a href="/s/2/1/Story-Two">Story Two</a><span data-xutime="1795220000">1h</span></div>
+      </body></html>`);
+    }
+    if (url.includes('m.fanfiction.net/m/a_story.php')) {
+      return new Response(`<html><body>
+        <a href="/logout.php">Logout</a>
+        <div class="bs"><a href="/s/1/1/Story-One">Story One</a> Updated: 05-01-25 - Published: 01-01-24</div>
+        <a href="/m/a_story.php?p=2">Next</a>
+      </body></html>`);
+    }
+    if (url.includes('m.fanfiction.net/m/f_story.php')) {
+      // Simulate a mobile list page with stories + pagination link but NO dates at all.
+      return new Response(`<html><body>
+        <a href="/logout.php">Logout</a>
+        <div class="bs"><a href="/s/3/1/Story-Three">Story Three</a></div>
+        <a href="/m/f_story.php?p=2">Next</a>
+      </body></html>`);
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  const toUpdate = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story One', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/2/', name: 'Story Two', lastUpdatedAt: '2026-10-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/3/', name: 'Story Three', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+
+  assert.deepEqual(Array.from(toUpdate), ['s/2/', 's/3/']);
+  // Desktop was tried only once (on page 1), then subsequent pages went straight to m.fanfiction.net,
+  // and Favorites stopped after page 1 because it had no update dates!
+  assert.deepEqual(
+    requests.map(r => r.url),
+    [
+      'https://www.fanfiction.net/alert/story.php',
+      'https://m.fanfiction.net/m/a_story.php',
+      'https://m.fanfiction.net/m/a_story.php?p=2',
+      'https://m.fanfiction.net/m/f_story.php',
+    ],
+  );
+});
+
+test('checkLibraryUpdates stops immediately when onProgress throws (task cancellation)', async () => {
+  const requests = [];
+  const { plugin } = harness(async url => {
+    requests.push(url);
+    return new Response(
+      accountPage(1, 50, 200, 2, {
+        listLabel: 'Stories you are following',
+      }),
+    );
+  });
+
+  let calls = 0;
+  await assert.rejects(
+    plugin.checkLibraryUpdates(
+      [{ path: 's/999/', name: 'Story 999', status: 'Ongoing' }],
+      {
+        onProgress: () => {
+          calls += 1;
+          if (calls === 2) throw new Error('Background task cancel');
+        },
+      },
+    ),
+    /Background task cancel/,
+  );
+  assert.equal(requests.length, 1);
+});

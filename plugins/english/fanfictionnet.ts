@@ -162,6 +162,10 @@ type ParseNovelOptions = {
   readonly isBackground?: boolean;
 };
 
+type LibraryUpdateCheckOptions = {
+  readonly onProgress?: (statusText: string) => void;
+};
+
 type PageTicket = { priority: Plugin.RequestPriority };
 
 type FetchOptions = NonNullable<Parameters<typeof fetchLib.fetchApi>[1]>;
@@ -324,7 +328,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.11.0';
+  version = '1.11.1';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -863,47 +867,75 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     );
   }
 
+  private preferNativeAccountUntil = 0;
+
   private async fetchPageHtml(
     url: string,
     waitForSelector: string,
     useWebViewSession: boolean,
     signal?: FetchSignal,
   ): Promise<string> {
-    const desktopInit: FetchOptions = {
-      credentials: 'include',
-      headers: { 'User-Agent': DESKTOP_USER_AGENT },
-    };
-    if (signal) desktopInit.signal = signal;
-    let res = await fetchLib.fetchApi(url, desktopInit);
-    if (res.status === 429) {
-      this.requestStats.throttled += 1;
-      this.pauseRequests(
-        'FanFiction.Net is limiting requests. Wait before retrying.',
-        res.headers.get('Retry-After'),
-      );
-    }
-    let html = await res.text();
+    let res: Response;
+    let html: string;
 
-    // If desktop UA hits Cloudflare, retry once with WebView's native UA + cookies so solved cf_clearance applies.
-    if (this.isChallengeResponse(res, html, useWebViewSession)) {
+    if (useWebViewSession && Date.now() < this.preferNativeAccountUntil) {
       const nativeInit: FetchOptions = { credentials: 'include' };
       if (signal) nativeInit.signal = signal;
-      const fallbackUrl = this.mobileFallbackUrl(url);
-      const fallbackRes = await fetchLib.fetchApi(fallbackUrl, nativeInit);
-      if (fallbackRes.status === 429) {
+      res = await fetchLib.fetchApi(this.mobileFallbackUrl(url), nativeInit);
+      if (res.status === 429) {
         this.requestStats.throttled += 1;
         this.pauseRequests(
           'FanFiction.Net is limiting requests. Wait before retrying.',
-          fallbackRes.headers.get('Retry-After'),
+          res.headers.get('Retry-After'),
         );
       }
-      const fallbackHtml = await fallbackRes.text();
+      html = await res.text();
       if (
-        fallbackRes.ok &&
-        !this.isChallengeResponse(fallbackRes, fallbackHtml, useWebViewSession)
+        !res.ok ||
+        this.isChallengeResponse(res, html, useWebViewSession)
       ) {
-        res = fallbackRes;
-        html = fallbackHtml;
+        this.preferNativeAccountUntil = 0;
+      }
+    } else {
+      const desktopInit: FetchOptions = {
+        credentials: 'include',
+        headers: { 'User-Agent': DESKTOP_USER_AGENT },
+      };
+      if (signal) desktopInit.signal = signal;
+      res = await fetchLib.fetchApi(url, desktopInit);
+      if (res.status === 429) {
+        this.requestStats.throttled += 1;
+        this.pauseRequests(
+          'FanFiction.Net is limiting requests. Wait before retrying.',
+          res.headers.get('Retry-After'),
+        );
+      }
+      html = await res.text();
+
+      // If desktop UA hits Cloudflare, retry once with WebView's native UA + cookies so solved cf_clearance applies.
+      if (this.isChallengeResponse(res, html, useWebViewSession)) {
+        const nativeInit: FetchOptions = { credentials: 'include' };
+        if (signal) nativeInit.signal = signal;
+        const fallbackUrl = this.mobileFallbackUrl(url);
+        const fallbackRes = await fetchLib.fetchApi(fallbackUrl, nativeInit);
+        if (fallbackRes.status === 429) {
+          this.requestStats.throttled += 1;
+          this.pauseRequests(
+            'FanFiction.Net is limiting requests. Wait before retrying.',
+            fallbackRes.headers.get('Retry-After'),
+          );
+        }
+        const fallbackHtml = await fallbackRes.text();
+        if (
+          fallbackRes.ok &&
+          !this.isChallengeResponse(fallbackRes, fallbackHtml, useWebViewSession)
+        ) {
+          res = fallbackRes;
+          html = fallbackHtml;
+          if (useWebViewSession) {
+            this.preferNativeAccountUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
+          }
+        }
       }
     }
 
@@ -1312,6 +1344,56 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     this.accountDelta = undefined;
   }
 
+  private ensureAccountDelta(now: number): AccountDeltaState {
+    if (
+      !this.accountDelta ||
+      now - this.accountDelta.startedAt > ACCOUNT_INDEX_TTL_MS
+    ) {
+      this.accountDelta = {
+        startedAt: now,
+        dates: new Map<string, number>(),
+        titles: new Map<string, string>(),
+        listIndex: 0,
+        page: 1,
+        pagesScanned: 0,
+        done: false,
+      };
+    }
+    return this.accountDelta;
+  }
+
+  private async advanceAccountDeltaPage(
+    delta: AccountDeltaState,
+    onProgress?: (statusText: string) => void,
+  ): Promise<void> {
+    const list = ACCOUNT_LIST_ORDER[delta.listIndex];
+    const page = delta.page;
+    const listLabel = list === 'follows' ? 'Story Alerts' : 'Favorites';
+    onProgress?.(`FanFiction.Net: scanning ${listLabel} (page ${page})`);
+    delta.pagesScanned += 1;
+    const result = await this.accountPage(list, page, 'background');
+    for (const item of result.novels) {
+      if (item.name && !delta.titles.has(item.path)) {
+        delta.titles.set(item.path, item.name);
+      }
+    }
+    result.updateDates.forEach((updatedBefore, path) => {
+      const existing = delta.dates.get(path);
+      if (existing === undefined || updatedBefore > existing)
+        delta.dates.set(path, updatedBefore);
+    });
+    // If page 1 returned stories with no update dates at all, this view cannot provide delta dates.
+    const missingDatesOnFirstPage =
+      page === 1 && result.novels.length > 0 && result.updateDates.size === 0;
+    if (result.next && !missingDatesOnFirstPage) {
+      delta.page += 1;
+    } else {
+      delta.listIndex += 1;
+      delta.page = 1;
+      if (delta.listIndex >= ACCOUNT_LIST_ORDER.length) delta.done = true;
+    }
+  }
+
   private async browseAccountList(
     list: AccountList,
     pageNo: number,
@@ -1332,26 +1414,45 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return (await this.accountPage(list, pageNo, 'interactive')).novels;
   }
 
+  private async populateAccountDelta(
+    wantedPaths: readonly string[],
+    onProgress?: (statusText: string) => void,
+  ): Promise<AccountDeltaState | undefined> {
+    const now = Date.now();
+    if (now < this.accountUnavailableUntil) return;
+    const delta = this.ensureAccountDelta(now);
+    const allFound = () =>
+      wantedPaths.every(path => delta.dates.has(path));
+    if (delta.done || allFound()) return delta;
+
+    try {
+      while (
+        !delta.done &&
+        delta.pagesScanned < ACCOUNT_INDEX_MAX_PAGES &&
+        delta.listIndex < ACCOUNT_LIST_ORDER.length
+      ) {
+        await this.advanceAccountDeltaPage(delta, onProgress);
+        // Stop if an account switch replaced this scan state.
+        if (this.accountDelta !== delta) return;
+        if (allFound()) break;
+      }
+      if (delta.pagesScanned >= ACCOUNT_INDEX_MAX_PAGES) delta.done = true;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AccountListError') {
+        this.accountUnavailableUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
+        return;
+      }
+      throw error;
+    }
+    return delta;
+  }
+
   private async lookupAccountDelta(
     storyPath: string,
   ): Promise<{ readonly updatedBefore: number; readonly name?: string } | undefined> {
     const now = Date.now();
     if (now < this.accountUnavailableUntil) return;
-    if (
-      !this.accountDelta ||
-      now - this.accountDelta.startedAt > ACCOUNT_INDEX_TTL_MS
-    ) {
-      this.accountDelta = {
-        startedAt: now,
-        dates: new Map<string, number>(),
-        titles: new Map<string, string>(),
-        listIndex: 0,
-        page: 1,
-        pagesScanned: 0,
-        done: false,
-      };
-    }
-    const delta = this.accountDelta;
+    const delta = this.ensureAccountDelta(now);
     const cachedDate = delta.dates.get(storyPath);
     if (cachedDate !== undefined) {
       return { updatedBefore: cachedDate, name: delta.titles.get(storyPath) };
@@ -1364,27 +1465,8 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         delta.pagesScanned < ACCOUNT_INDEX_MAX_PAGES &&
         delta.listIndex < ACCOUNT_LIST_ORDER.length
       ) {
-        const list = ACCOUNT_LIST_ORDER[delta.listIndex];
-        const page = delta.page;
-        delta.pagesScanned += 1;
-        const result = await this.accountPage(list, page, 'background');
-        for (const item of result.novels) {
-          if (item.name && !delta.titles.has(item.path)) {
-            delta.titles.set(item.path, item.name);
-          }
-        }
-        result.updateDates.forEach((updatedBefore, path) => {
-          const existing = delta.dates.get(path);
-          if (existing === undefined || updatedBefore > existing)
-            delta.dates.set(path, updatedBefore);
-        });
-        if (result.next) {
-          delta.page += 1;
-        } else {
-          delta.listIndex += 1;
-          delta.page = 1;
-          if (delta.listIndex >= ACCOUNT_LIST_ORDER.length) delta.done = true;
-        }
+        await this.advanceAccountDeltaPage(delta);
+        if (this.accountDelta !== delta) return;
         const foundDate = delta.dates.get(storyPath);
         if (foundDate !== undefined) {
           return {
@@ -1406,11 +1488,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return { updatedBefore: finalDate, name: delta.titles.get(storyPath) };
   }
 
-  private listingUpdateUpperBound(text: string): number | undefined {
-    const parts = text.trim().match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
-    if (!parts) return;
-    const [, month, day, year] = parts.map(Number);
-    const start = Date.UTC(year, month - 1, day);
+  private calendarDayUpperBound(
+    year: number,
+    month: number,
+    day: number,
+  ): number | undefined {
+    const fullYear = year < 100 ? 2000 + year : year;
+    const start = Date.UTC(fullYear, month - 1, day);
     if (
       new Date(start).getUTCMonth() !== month - 1 ||
       new Date(start).getUTCDate() !== day
@@ -1418,6 +1502,87 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       return;
     // The list exposes a calendar date. Keep same-day changes eligible in every time zone.
     return start + 2 * 24 * 60 * 60 * 1000;
+  }
+
+  private listingUpdateUpperBound(text: string): number | undefined {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    const mdy = trimmed.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})$/);
+    if (mdy) {
+      const [, month, day, year] = mdy.map(Number);
+      return this.calendarDayUpperBound(year, month, day);
+    }
+
+    const ymd = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+    if (ymd) {
+      const [, year, month, day] = ymd.map(Number);
+      return this.calendarDayUpperBound(year, month, day);
+    }
+
+    const monthNames: Record<string, number> = {
+      jan: 1,
+      feb: 2,
+      mar: 3,
+      apr: 4,
+      may: 5,
+      jun: 6,
+      jul: 7,
+      aug: 8,
+      sep: 9,
+      oct: 10,
+      nov: 11,
+      dec: 12,
+    };
+    const named = trimmed.match(
+      /^([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s+(\d{2}|\d{4}))?$/,
+    );
+    if (named) {
+      const month = monthNames[named[1].slice(0, 3).toLowerCase()];
+      const day = Number(named[2]);
+      if (month) {
+        const now = new Date();
+        let year = named[3] ? Number(named[3]) : now.getUTCFullYear();
+        if (!named[3]) {
+          const candidate = Date.UTC(year, month - 1, day);
+          if (candidate > now.getTime() + 2 * 24 * 60 * 60 * 1000) year -= 1;
+        }
+        return this.calendarDayUpperBound(year, month, day);
+      }
+    }
+
+    if (
+      /^(?:just now|today|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)(?:\s+ago)?)$/i.test(
+        trimmed,
+      )
+    ) {
+      const now = new Date();
+      return this.calendarDayUpperBound(
+        now.getUTCFullYear(),
+        now.getUTCMonth() + 1,
+        now.getUTCDate(),
+      );
+    }
+
+    if (/^yesterday$/i.test(trimmed)) {
+      const d = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      return this.calendarDayUpperBound(
+        d.getUTCFullYear(),
+        d.getUTCMonth() + 1,
+        d.getUTCDate(),
+      );
+    }
+
+    const daysAgo = trimmed.match(/^(\d+)\s*(?:d|day|days)(?:\s+ago)?$/i);
+    if (daysAgo) {
+      const d = new Date(Date.now() - Number(daysAgo[1]) * 24 * 60 * 60 * 1000);
+      return this.calendarDayUpperBound(
+        d.getUTCFullYear(),
+        d.getUTCMonth() + 1,
+        d.getUTCDate(),
+      );
+    }
+    return undefined;
   }
 
   private extractAccountId($: CheerioAPI): string | undefined {
@@ -1442,7 +1607,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       if (profileId) return;
       const link = $(element);
       const href = (link.attr('href') ?? '').replace(
-        /^https?:\/\/www\.fanfiction\.net(?=\/)/i,
+        /^https?:\/\/(?:www|m)\.fanfiction\.net(?=\/)/i,
         '',
       );
       const userMatch = href.match(/^\/u\/([1-9]\d*)(?:\/|$)/i);
@@ -1450,7 +1615,10 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         profileId = `u:${userMatch[1]}`;
         return;
       }
-      if (!accountName && /\/account\/(?:settings|profile)\.php/i.test(href)) {
+      if (
+        !accountName &&
+        /\/(?:account\/(?:settings|profile)|m\/settings)\.php/i.test(href)
+      ) {
         const label = link.text().trim();
         if (
           label &&
@@ -1493,7 +1661,10 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         this.activeAccountId = result.accountId;
         this.accountPages.set(`${result.accountId}:${list}:${pageNo}`, result);
       } else {
-        this.clearAccountCache();
+        // Without a verified account id, do not retain private pages for stale reuse,
+        // but preserve any in-progress accountDelta scan so batch checks do not restart.
+        this.activeAccountId = undefined;
+        this.accountPages.clear();
       }
       this.accountPageNext.set(`${list}:${pageNo}`, {
         checkedAt: result.checkedAt,
@@ -1521,7 +1692,11 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     path: string,
     pageNo: number,
   ): AccountPage {
-    if (!$('a[href*="logout"], a[href*="/account/settings.php"]').length) {
+    if (
+      !$(
+        'a[href*="logout"], a[href*="/account/settings.php"], a[href*="/m/settings.php"]',
+      ).length
+    ) {
       throw new AccountListError(
         'Sign in to FanFiction.Net using the globe above, then return here and tap Retry.',
       );
@@ -1531,6 +1706,18 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     const updateDates = new Map<string, number>();
     let next = false;
     const relative = path.slice(path.lastIndexOf('/') + 1);
+    const mobilePath = this.mobileFallbackUrl(`${this.site}${path}`).replace(
+      /^https?:\/\/[^/]+/i,
+      '',
+    );
+    const mobileRelative = mobilePath.slice(mobilePath.lastIndexOf('/') + 1);
+    const validPaginationPaths = new Set([
+      '',
+      path,
+      relative,
+      mobilePath,
+      mobileRelative,
+    ]);
     const updatedColumn = $('th')
       .filter((_, item) => $(item).text().trim() === 'Updated')
       .first()
@@ -1539,7 +1726,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     $('a[href]').each((_, element) => {
       const link = $(element);
       const href = (link.attr('href') ?? '').replace(
-        /^https?:\/\/www\.fanfiction\.net(?=\/)/i,
+        /^https?:\/\/(?:www|m)\.fanfiction\.net(?=\/)/i,
         '',
       );
       const id = href.match(/^\/s\/(\d+)(?:\/|$)/)?.[1];
@@ -1551,16 +1738,42 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
           path: storyPath,
           cover: this.absoluteCover(link.find('img').first().attr('src'), 180),
         });
+        let date: number | undefined;
         if (updatedColumn >= 0) {
-          const date = this.listingUpdateUpperBound(
+          date = this.listingUpdateUpperBound(
             link.closest('tr').children('td').eq(updatedColumn).text(),
           );
-          if (date !== undefined) updateDates.set(storyPath, date);
         }
+        if (date === undefined) {
+          const container = link.closest('tr, div.bs, div.z-list, li');
+          if (container.length) {
+            const xutime = Number(
+              container.find('[data-xutime]').first().attr('data-xutime'),
+            );
+            if (Number.isFinite(xutime) && xutime > 0) {
+              const d = new Date(xutime * 1000);
+              date = this.calendarDayUpperBound(
+                d.getUTCFullYear(),
+                d.getUTCMonth() + 1,
+                d.getUTCDate(),
+              );
+            }
+            if (date === undefined) {
+              const containerText = container.text().replace(/\s+/g, ' ');
+              const updatedMatch = containerText.match(
+                /\bUpdated:\s*([^·|\n]+?)(?=\s+(?:Published:|Added:|Rated:|Reviews:|Favs:|Follows:|Words:|Chapters:|-\s)|$)/i,
+              );
+              if (updatedMatch) {
+                date = this.listingUpdateUpperBound(updatedMatch[1]);
+              }
+            }
+          }
+        }
+        if (date !== undefined) updateDates.set(storyPath, date);
       }
 
       const [linkPath, query] = href.split('?');
-      if (linkPath && linkPath !== path && linkPath !== relative) return;
+      if (linkPath && !validPaginationPaths.has(linkPath)) return;
       const page = query?.match(/(?:^|&)(?:p|page|ppage)=(\d+)(?:&|#|$)/i);
       if (page && Number(page[1]) > pageNo) next = true;
     });
@@ -1738,6 +1951,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
    */
   async checkLibraryUpdates(
     candidates: readonly LibraryUpdateCandidate[],
+    options?: LibraryUpdateCheckOptions,
   ): Promise<string[] | undefined> {
     this.pruneExpired();
     const pause = this.readPause();
@@ -1756,15 +1970,19 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       };
     });
 
-    // Populate the account delta index across Story Alerts and Favorites.
+    const wantedPaths: string[] = [];
+    const seenWanted = new Set<string>();
     for (const item of normalized) {
-      if (!item.storyPath) continue;
-      await this.lookupAccountDelta(item.storyPath);
-      if (this.accountUnavailableUntil > Date.now()) return;
-      if (this.accountDelta?.done) break;
+      if (item.storyPath && !seenWanted.has(item.storyPath)) {
+        seenWanted.add(item.storyPath);
+        wantedPaths.push(item.storyPath);
+      }
     }
 
-    const delta = this.accountDelta;
+    const delta = await this.populateAccountDelta(
+      wantedPaths,
+      options?.onProgress,
+    );
     if (!delta || delta.dates.size === 0) return;
 
     const pathsToUpdate: string[] = [];
