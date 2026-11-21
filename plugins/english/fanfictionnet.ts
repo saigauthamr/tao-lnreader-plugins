@@ -74,7 +74,8 @@ const SECTION_LABELS: Record<string, string> = Object.fromEntries(SECTIONS);
 const INDEX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LIST_TTL_MS = 15 * 60 * 1000;
 // Short, so library update checks still see new chapters.
-const NOVEL_TTL_MS = 10 * 60 * 1000;
+const NOVEL_TTL_MS = 2 * 60 * 1000;
+const INTERACTIVE_NOVEL_TTL_MS = 30 * 1000;
 const BACKGROUND_FALLBACK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const COLD_START_RECENT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 const BASELINE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
@@ -83,13 +84,15 @@ const CHAPTER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CHAPTER_CACHE_SIZE = 500;
 const ACCOUNT_PAGE_SIZE = 50;
 const ACCOUNT_PAGE_TTL_MS = 5 * 60 * 1000;
+const ACCOUNT_UPDATE_PAGE_TTL_MS = 30 * 1000;
 const ACCOUNT_INDEX_TTL_MS = 30 * 60 * 1000;
 const ACCOUNT_STALE_MAX_AGE_MS = 30 * 60 * 1000;
 const ACCOUNT_INDEX_MAX_PAGES = 40;
 const ACCOUNT_MEMBERSHIP_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const WATERMARK_SAFETY_MS = 12 * 60 * 60 * 1000;
 const ACCOUNT_INDEX_STORAGE_KEY = 'account-delta-index:v1';
-const ACCOUNT_UNAVAILABLE_TTL_MS = 15 * 60 * 1000;
+const ACCOUNT_UNAVAILABLE_TTL_MS = 2 * 60 * 1000;
+const NATIVE_ACCOUNT_PREFER_TTL_MS = 15 * 60 * 1000;
 const STALE_BROWSE_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 25 * 1000;
 const INTERACTIVE_SPACING_MS = 300;
@@ -344,7 +347,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.12.0';
+  version = '1.12.1';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -949,7 +952,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
           res = fallbackRes;
           html = fallbackHtml;
           if (useWebViewSession) {
-            this.preferNativeAccountUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
+            this.preferNativeAccountUntil = Date.now() + NATIVE_ACCOUNT_PREFER_TTL_MS;
           }
         }
       }
@@ -1439,7 +1442,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     const listLabel = list === 'follows' ? 'Story Alerts' : 'Favorites';
     onProgress?.(`FanFiction.Net: scanning ${listLabel} (page ${page})`);
     delta.pagesScanned += 1;
-    const result = await this.accountPage(list, page, 'background');
+    const result = await this.accountPage(list, page, 'background', ACCOUNT_UPDATE_PAGE_TTL_MS);
     for (const item of result.novels) {
       if (item.name && !delta.titles.has(item.path)) {
         delta.titles.set(item.path, item.name);
@@ -1672,12 +1675,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     list: AccountList,
     pageNo: number,
     priority: Plugin.RequestPriority,
+    cacheTtlMs = ACCOUNT_PAGE_TTL_MS,
   ): Promise<AccountPage> {
     const accountId = this.activeAccountId;
     const cached = accountId
       ? this.accountPages.get(`${accountId}:${list}:${pageNo}`)
       : undefined;
-    if (cached && Date.now() - cached.checkedAt < ACCOUNT_PAGE_TTL_MS) {
+    if (cached && Date.now() - cached.checkedAt < cacheTtlMs) {
       this.requestStats.cacheHits += 1;
       return cached;
     }
@@ -1686,6 +1690,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       const url = `${this.site}${path}${pageNo === 1 ? '' : `?p=${pageNo}`}`;
       const $ = await this.getPage(url, 'body', { account: true, priority });
       const result = this.parseAccountPage($, path, pageNo);
+      this.accountUnavailableUntil = 0;
       if (result.accountId) {
         if (
           this.activeAccountId !== undefined &&
@@ -2086,7 +2091,12 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             `FanFiction.Net: scanning ${listLabel} (page ${page})`,
           );
           pagesScanned += 1;
-          const result = await this.accountPage(list, page, 'background');
+          const result = await this.accountPage(
+            list,
+            page,
+            'background',
+            ACCOUNT_UPDATE_PAGE_TTL_MS,
+          );
 
           if (result.accountId) {
             if (
@@ -2355,7 +2365,9 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     try {
       this.pruneExpired();
       const baseline = storage.get<NovelBaseline>(`novel-baseline:${id}`);
-      if (baseline && now - baseline.fetchedAt < NOVEL_TTL_MS) {
+      const novelTtlMs =
+        priority === 'background' ? NOVEL_TTL_MS : INTERACTIVE_NOVEL_TTL_MS;
+      if (baseline && now - baseline.fetchedAt < novelTtlMs) {
         this.requestStats.cacheHits += 1;
         return baseline.novel;
       }

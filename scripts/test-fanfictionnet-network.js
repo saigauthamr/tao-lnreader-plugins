@@ -1210,3 +1210,78 @@ test('checkLibraryUpdates preserves pending retries across unrelated category up
   assert.deepEqual(Array.from(run4), []);
   assert.equal(requests.length, 1);
 });
+
+test('uses shorter freshness TTLs for checkLibraryUpdates, manual novel refresh, and signed-out recovery', async () => {
+  const requests = [];
+  let signedIn = false;
+  let alertUpdated = '11-10-2026';
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    if (url.includes('/alert/story.php') || url.includes('/favorites/story.php')) {
+      if (!signedIn) {
+        return new Response('<html><body>Please sign in</body></html>');
+      }
+      return new Response(
+        accountPage(1, 2, 2, undefined, {
+          listLabel: url.includes('/alert/')
+            ? 'Stories you are following'
+            : 'Favorite Stories',
+          updated: id => (id === 1 ? alertUpdated : '11-10-2026'),
+        }),
+      );
+    }
+    if (url.includes('/s/1/1/')) {
+      return new Response(storyHtml(1, { chapters: 2 }));
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-11-10T12:00:00.000Z', status: 'Ongoing' },
+  ];
+
+  // Signed-out check sets 2-minute backoff, which clears immediately once an interactive account fetch succeeds.
+  assert.equal(await plugin.checkLibraryUpdates(candidates), undefined);
+  assert.equal(requests.length, 1);
+
+  requests.length = 0;
+  time.now += 30_000;
+  assert.equal(await plugin.checkLibraryUpdates(candidates), undefined);
+  assert.equal(requests.length, 0);
+
+  // User signs in and opens Favorites in Browse -> clears accountUnavailableUntil immediately.
+  signedIn = true;
+  await plugin.popularNovels(1, { filters: { list: { value: 'favorites' } } });
+  requests.length = 0;
+
+  // Run 1 of checkLibraryUpdates now succeeds immediately (no 15-minute lockout!).
+  assert.deepEqual(Array.from(await plugin.checkLibraryUpdates(candidates)), []);
+  assert.equal(requests.length, 1);
+
+  // Within 30s debounce: served from RAM (0 requests).
+  requests.length = 0;
+  time.now += 10_000;
+  assert.deepEqual(Array.from(await plugin.checkLibraryUpdates(candidates)), []);
+  assert.equal(requests.length, 0);
+
+  // Past 30s (at +31s): checkLibraryUpdates fetches Page 1 live and sees the new chapter immediately!
+  requests.length = 0;
+  alertUpdated = '11-21-2026';
+  time.now += 25_000;
+  assert.deepEqual(
+    Array.from(await plugin.checkLibraryUpdates(candidates)),
+    ['s/1/'],
+  );
+  assert.equal(requests.length, 1);
+
+  // Interactive novel refresh uses 30s TTL (refreshes at +31s instead of waiting 10 minutes).
+  requests.length = 0;
+  await plugin.parseNovel('s/1/', 'interactive');
+  assert.equal(requests.length, 1);
+  time.now += 15_000;
+  await plugin.parseNovel('s/1/', 'interactive');
+  assert.equal(requests.length, 1);
+  time.now += 20_000;
+  await plugin.parseNovel('s/1/', 'interactive');
+  assert.equal(requests.length, 2);
+});
