@@ -75,6 +75,8 @@ const INDEX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LIST_TTL_MS = 15 * 60 * 1000;
 // Short, so library update checks still see new chapters.
 const NOVEL_TTL_MS = 10 * 60 * 1000;
+const BACKGROUND_FALLBACK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const COLD_START_RECENT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 const BASELINE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const COMPLETED_RECHECK_MS = 30 * 24 * 60 * 60 * 1000;
 const CHAPTER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -114,6 +116,7 @@ class AccountListError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AccountListError';
+    Object.setPrototypeOf(this, AccountListError.prototype);
   }
 }
 
@@ -125,6 +128,7 @@ class SourceUpdatePaused extends Error {
   ) {
     super(message);
     this.name = 'SourceUpdatePaused';
+    Object.setPrototypeOf(this, SourceUpdatePaused.prototype);
   }
 }
 
@@ -138,6 +142,12 @@ type PauseRecord = {
 type NovelBaseline = {
   readonly fetchedAt: number;
   readonly novel: Plugin.SourceNovel;
+};
+
+type NovelDeltaMarker = {
+  readonly seenUpdatedBefore: number;
+  readonly checkedAt: number;
+  readonly name?: string;
 };
 
 type PageTicket = { priority: Plugin.RequestPriority };
@@ -164,6 +174,7 @@ type AccountPage = {
 type AccountDeltaState = {
   readonly startedAt: number;
   readonly dates: Map<string, number>;
+  readonly titles: Map<string, string>;
   listIndex: number;
   page: number;
   pagesScanned: number;
@@ -301,7 +312,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.10.1';
+  version = '1.10.2';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -600,8 +611,39 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return new SourceUpdatePaused(record.message, this.id, record.retryAt);
   }
 
+  private pauseNotifiedUntil = 0;
+  private batchPauseActive = false;
+
   private clearPause() {
     storage.delete(SOURCE_PAUSE_KEY);
+    this.pauseNotifiedUntil = 0;
+    this.batchPauseActive = false;
+  }
+
+  private isSourceUpdatePaused(error: unknown): error is SourceUpdatePaused {
+    return error instanceof Error && error.name === 'SourceUpdatePaused';
+  }
+
+  private handleBackgroundPause(
+    pause: SourceUpdatePaused,
+    storyPath: string,
+    baseline?: NovelBaseline,
+    fallbackName?: string,
+  ): Plugin.SourceNovel {
+    this.batchPauseActive = true;
+    const now = Date.now();
+    if (now >= this.pauseNotifiedUntil) {
+      this.pauseNotifiedUntil = Math.max(pause.retryAt, now + MIN_PAUSE_MS);
+      throw pause;
+    }
+    this.requestStats.cacheHits += 1;
+    return (
+      baseline?.novel ?? {
+        path: storyPath,
+        name: fallbackName ?? '',
+        chapters: [],
+      }
+    );
   }
 
   onSourceWebViewVerified() {
@@ -1102,7 +1144,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     this.pruned = true;
     try {
       for (const key of storage.getAllKeys()) {
-        if (!/^(browse|list|search|novel|novel-baseline|chapter):/.test(key))
+        if (!/^(browse|list|search|novel|novel-baseline|novel-delta|chapter):/.test(key))
           continue;
         const entry = storage.get(key, true) as
           { expires?: number } | undefined;
@@ -1278,9 +1320,9 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     return (await this.accountPage(list, pageNo, 'interactive')).novels;
   }
 
-  private async lookupAccountUpdateDate(
+  private async lookupAccountDelta(
     storyPath: string,
-  ): Promise<number | undefined> {
+  ): Promise<{ readonly updatedBefore: number; readonly name?: string } | undefined> {
     const now = Date.now();
     if (now < this.accountUnavailableUntil) return;
     if (
@@ -1290,6 +1332,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       this.accountDelta = {
         startedAt: now,
         dates: new Map<string, number>(),
+        titles: new Map<string, string>(),
         listIndex: 0,
         page: 1,
         pagesScanned: 0,
@@ -1297,7 +1340,10 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       };
     }
     const delta = this.accountDelta;
-    if (delta.dates.has(storyPath)) return delta.dates.get(storyPath);
+    const cachedDate = delta.dates.get(storyPath);
+    if (cachedDate !== undefined) {
+      return { updatedBefore: cachedDate, name: delta.titles.get(storyPath) };
+    }
     if (delta.done) return;
 
     try {
@@ -1310,6 +1356,11 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         const page = delta.page;
         delta.pagesScanned += 1;
         const result = await this.accountPage(list, page, 'background');
+        for (const item of result.novels) {
+          if (item.name && !delta.titles.has(item.path)) {
+            delta.titles.set(item.path, item.name);
+          }
+        }
         result.updateDates.forEach((updatedBefore, path) => {
           const existing = delta.dates.get(path);
           if (existing === undefined || updatedBefore > existing)
@@ -1322,7 +1373,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
           delta.page = 1;
           if (delta.listIndex >= ACCOUNT_LIST_ORDER.length) delta.done = true;
         }
-        if (delta.dates.has(storyPath)) return delta.dates.get(storyPath);
+        const foundDate = delta.dates.get(storyPath);
+        if (foundDate !== undefined) {
+          return {
+            updatedBefore: foundDate,
+            name: delta.titles.get(storyPath),
+          };
+        }
       }
       if (delta.pagesScanned >= ACCOUNT_INDEX_MAX_PAGES) delta.done = true;
     } catch (error) {
@@ -1332,7 +1389,9 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       }
       throw error;
     }
-    return delta.dates.get(storyPath);
+    const finalDate = delta.dates.get(storyPath);
+    if (finalDate === undefined) return;
+    return { updatedBefore: finalDate, name: delta.titles.get(storyPath) };
   }
 
   private listingUpdateUpperBound(text: string): number | undefined {
@@ -1654,30 +1713,98 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     const id = this.storyId('/' + novelPath);
     if (!id) throw new Error(`Not a FanFiction.Net story path: ${novelPath}`);
     const storyPath = `s/${id}/`;
+    const now = Date.now();
+    const isConsecutiveBatchCall =
+      this.lastParseNovelId !== undefined &&
+      this.lastParseNovelId !== id &&
+      now - this.lastParseNovelAt <= BATCH_DETECT_WINDOW_MS;
     const priority = this.resolveNovelPriority(id, explicitPriority);
-    this.lastParseNovelAt = Date.now();
+    if (!isConsecutiveBatchCall) {
+      this.batchPauseActive = false;
+    }
+    this.lastParseNovelAt = now;
     this.lastParseNovelId = id;
     try {
       this.pruneExpired();
       const baseline = storage.get<NovelBaseline>(`novel-baseline:${id}`);
-      const now = Date.now();
       if (baseline && now - baseline.fetchedAt < NOVEL_TTL_MS) {
         this.requestStats.cacheHits += 1;
         return baseline.novel;
       }
 
-      if (priority === 'background' && baseline) {
+      if (priority === 'background' && this.batchPauseActive) {
+        this.requestStats.cacheHits += 1;
+        return (
+          baseline?.novel ?? {
+            path: storyPath,
+            name: '',
+            chapters: [],
+          }
+        );
+      }
+
+      let deltaEntry:
+        | { readonly updatedBefore: number; readonly name?: string }
+        | undefined;
+      if (priority === 'background') {
         if (
+          baseline &&
           baseline.novel.status === NovelStatus.Completed &&
           now - baseline.fetchedAt < COMPLETED_RECHECK_MS
         ) {
           this.requestStats.cacheHits += 1;
           return baseline.novel;
         }
-        const updatedBefore = await this.lookupAccountUpdateDate(storyPath);
-        if (
-          updatedBefore !== undefined &&
-          updatedBefore <= baseline.fetchedAt
+
+        try {
+          deltaEntry = await this.lookupAccountDelta(storyPath);
+        } catch (error) {
+          if (this.isSourceUpdatePaused(error)) {
+            return this.handleBackgroundPause(error, storyPath, baseline);
+          }
+          throw error;
+        }
+
+        if (deltaEntry !== undefined) {
+          if (baseline) {
+            if (deltaEntry.updatedBefore <= baseline.fetchedAt) {
+              this.requestStats.cacheHits += 1;
+              return baseline.novel;
+            }
+          } else {
+            const marker = storage.get<NovelDeltaMarker>(`novel-delta:${id}`);
+            if (marker) {
+              if (deltaEntry.updatedBefore <= marker.seenUpdatedBefore) {
+                this.requestStats.cacheHits += 1;
+                return {
+                  path: storyPath,
+                  name: deltaEntry.name ?? marker.name ?? '',
+                  chapters: [],
+                };
+              }
+            } else if (
+              deltaEntry.updatedBefore < now - COLD_START_RECENT_WINDOW_MS
+            ) {
+              storage.set<NovelDeltaMarker>(
+                `novel-delta:${id}`,
+                {
+                  seenUpdatedBefore: deltaEntry.updatedBefore,
+                  checkedAt: now,
+                  name: deltaEntry.name,
+                },
+                now + BASELINE_TTL_MS,
+              );
+              this.requestStats.cacheHits += 1;
+              return {
+                path: storyPath,
+                name: deltaEntry.name ?? '',
+                chapters: [],
+              };
+            }
+          }
+        } else if (
+          baseline &&
+          now - baseline.fetchedAt < BACKGROUND_FALLBACK_COOLDOWN_MS
         ) {
           this.requestStats.cacheHits += 1;
           return baseline.novel;
@@ -1685,16 +1812,53 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       }
 
       const pause = this.readPause();
-      if (pause) throw pause;
+      if (pause) {
+        if (priority === 'background') {
+          return this.handleBackgroundPause(
+            pause,
+            storyPath,
+            baseline,
+            deltaEntry?.name,
+          );
+        }
+        throw pause;
+      }
 
       const url = `${this.site}/s/${id}/1/`;
       const coalesced = this.inFlightPages.has(`public:${url}`);
       if (!coalesced) {
-        if (priority === 'background') this.assertStoryBudget(Date.now());
+        if (priority === 'background') {
+          try {
+            this.assertStoryBudget(Date.now());
+          } catch (error) {
+            if (this.isSourceUpdatePaused(error)) {
+              return this.handleBackgroundPause(
+                error,
+                storyPath,
+                baseline,
+                deltaEntry?.name,
+              );
+            }
+            throw error;
+          }
+        }
         this.recordStoryFetch(Date.now());
       }
 
-      const $ = await this.getPage(url, '#profile_top', { priority });
+      let $: CheerioAPI;
+      try {
+        $ = await this.getPage(url, '#profile_top', { priority });
+      } catch (error) {
+        if (priority === 'background' && this.isSourceUpdatePaused(error)) {
+          return this.handleBackgroundPause(
+            error,
+            storyPath,
+            baseline,
+            deltaEntry?.name,
+          );
+        }
+        throw error;
+      }
       const novel = this.novelFromPage($, id);
       const fetchedAt = Date.now();
       storage.set<NovelBaseline>(
@@ -1702,6 +1866,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         { fetchedAt, novel },
         fetchedAt + BASELINE_TTL_MS,
       );
+      storage.delete(`novel-delta:${id}`);
       // The story page is chapter 1, so reading it later costs no request.
       const first = this.chapterText($);
       if (first) await this.cacheChapter(`s/${id}/1/`, first);

@@ -437,7 +437,7 @@ test('caps a 995-story cold stock LNReader sweep at 15 live fetches and resumes 
     storyRequests,
     Array.from({ length: 15 }, (_, i) => i + 1),
   );
-  assert.equal(pausedErrors, 980);
+  assert.equal(pausedErrors, 1);
   // Batch pacing delays should be jittered between 2.5s and 4.0s (accounting for LNReader's 1s sleep).
   assert.ok(pacingDelays.some(d => d >= 1500 && d <= 4000));
 
@@ -499,10 +499,10 @@ test('uses signed-in account list dates to skip unchanged stories without bumpin
     return new Response('Not found', { status: 404 });
   });
 
-  // Initial baseline fetch for stories 1 (Completed), 2 (Ongoing unchanged), 3 (Ongoing updated later).
-  await plugin.parseNovel('s/1/', 'background');
-  await plugin.parseNovel('s/2/', 'background');
-  await plugin.parseNovel('s/3/', 'background');
+  // Initial baseline fetch (simulating interactive adds) for stories 1 (Completed), 2 (Ongoing unchanged), 3 (Ongoing updated later).
+  await plugin.parseNovel('s/1/', 'interactive');
+  await plugin.parseNovel('s/2/', 'interactive');
+  await plugin.parseNovel('s/3/', 'interactive');
   assert.deepEqual(storyRequests, [1, 2, 3]);
   const baseline2FetchedAt = state.get('novel-baseline:2').value.fetchedAt;
   const baseline3FetchedAt = state.get('novel-baseline:3').value.fetchedAt;
@@ -551,12 +551,21 @@ test('backs off account-list delta lookups for signed-out users without hammerin
     return new Response('Not found', { status: 404 });
   });
 
-  // Baseline 3 ongoing stories first.
+  // Baseline 3 ongoing stories first (probes /alert/story.php once, then backs off).
   for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
+  assert.equal(accountRequests.length, 1);
+  accountRequests.length = 0;
   storyRequests.length = 0;
 
-  // 2 hours later, batch update runs while signed out: should check /alert/story.php only ONCE.
+  // 2 hours later (within 12h signed-out fallback cooldown): checks /alert/story.php once, skips live fetches.
   time.now += 2 * 60 * 60_000;
+  for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
+  assert.equal(accountRequests.length, 1);
+  assert.deepEqual(storyRequests, []);
+
+  // 13 hours later (past 12h fallback cooldown): probes /alert/story.php once, then refreshes all 3 live.
+  accountRequests.length = 0;
+  time.now += 13 * 60 * 60_000;
   for (const id of [1, 2, 3]) await plugin.parseNovel(`s/${id}/`, 'background');
   assert.equal(accountRequests.length, 1);
   assert.deepEqual(storyRequests, [1, 2, 3]);
@@ -617,4 +626,113 @@ test('falls back to WebView native UA and parses m.fanfiction.net HTML when desk
   assert.equal(hits.length, 1);
   assert.equal(hits[0].path, 's/77/');
   assert.equal(hits[0].name, 'Mobile Hit');
+});
+
+test('advances through ongoing stories across sequential windows when signed out without looping on #1..#15', async () => {
+  const storyRequests = [];
+  const { plugin, time } = harness(async url => {
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      storyRequests.push(Number(match[1]));
+      return new Response(storyHtml(match[1], { complete: false }));
+    }
+    return new Response('<html><body>Sign in</body></html>');
+  });
+
+  // Window 1: checks ongoing stories #1..#15, emits 1 toast, silently skips #16..#45.
+  let toasts = 0;
+  for (let id = 1; id <= 45; id += 1) {
+    try {
+      await plugin.parseNovel(`s/${id}/`);
+      time.now += 1000;
+    } catch (error) {
+      assert.equal(error.name, 'SourceUpdatePaused');
+      toasts += 1;
+    }
+  }
+  assert.equal(toasts, 1);
+  assert.deepEqual(
+    storyRequests,
+    Array.from({ length: 15 }, (_, i) => i + 1),
+  );
+
+  // Window 2 (16 min later): skips #2..#15 (within 12h fallback cooldown), advances to #16..#29.
+  storyRequests.length = 0;
+  toasts = 0;
+  time.now += 16 * 60_000;
+  for (let id = 1; id <= 45; id += 1) {
+    try {
+      await plugin.parseNovel(`s/${id}/`);
+      time.now += 1000;
+    } catch (error) {
+      assert.equal(error.name, 'SourceUpdatePaused');
+      toasts += 1;
+    }
+  }
+  assert.equal(toasts, 1);
+  assert.equal(storyRequests.length, 15);
+  for (let id = 2; id <= 15; id += 1) {
+    assert.ok(!storyRequests.includes(id), `Expected ongoing story ${id} to be skipped`);
+  }
+  assert.ok(storyRequests.includes(16));
+  assert.ok(storyRequests.includes(29));
+});
+
+test('uses signed-in account list dates on cold-start migrated stories without live-fetching unchanged fics', async () => {
+  const storyRequests = [];
+  const accountRequests = [];
+  let updatedMap = {
+    1: '05-01-2025', // old migrated fic
+    2: '11-19-2026', // updated yesterday (within 3-day cold-start window)
+    3: '10-15-2026', // old migrated fic that updates later
+  };
+  const { plugin, time } = harness(async url => {
+    if (url.includes('/alert/story.php')) {
+      accountRequests.push(url);
+      return new Response(
+        accountPage(1, 3, 3, undefined, {
+          listLabel: 'Stories you are following',
+          updated: id => updatedMap[id] ?? '05-01-2025',
+        }),
+      );
+    }
+    const match = url.match(/\/s\/(\d+)\/1\//);
+    if (match) {
+      const id = Number(match[1]);
+      storyRequests.push(id);
+      return new Response(storyHtml(id, { complete: false, chapters: 5 }));
+    }
+    return new Response('Not found', { status: 404 });
+  });
+
+  // First background sweep on migrated stories with NO baselines:
+  // Story 1 & 3 are >3 days old -> skipped with empty chapters (0 live fetches); Story 2 is recent -> live fetched.
+  const r1 = await plugin.parseNovel('s/1/', 'background');
+  const r2 = await plugin.parseNovel('s/2/', 'background');
+  const r3 = await plugin.parseNovel('s/3/', 'background');
+  assert.equal(r1.chapters.length, 0);
+  assert.equal(r1.name, 'Story 1');
+  assert.equal(r2.chapters.length, 5);
+  assert.equal(r3.chapters.length, 0);
+  assert.deepEqual(storyRequests, [2]);
+  assert.equal(accountRequests.length, 1);
+
+  // Next day: story 3 posts a new chapter!
+  storyRequests.length = 0;
+  accountRequests.length = 0;
+  time.now += 24 * 60 * 60_000;
+  updatedMap = {
+    1: '05-01-2025',
+    2: '11-19-2026',
+    3: '11-22-2026',
+  };
+
+  const n1 = await plugin.parseNovel('s/1/', 'background');
+  const n2 = await plugin.parseNovel('s/2/', 'background');
+  const n3 = await plugin.parseNovel('s/3/', 'background');
+  assert.equal(n1.chapters.length, 0);
+  assert.equal(n2.chapters.length, 5);
+  assert.equal(n3.chapters.length, 5);
+  // Only story 3 triggered a live fetch!
+  assert.deepEqual(storyRequests, [3]);
 });
