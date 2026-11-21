@@ -85,7 +85,10 @@ const ACCOUNT_PAGE_SIZE = 50;
 const ACCOUNT_PAGE_TTL_MS = 5 * 60 * 1000;
 const ACCOUNT_INDEX_TTL_MS = 30 * 60 * 1000;
 const ACCOUNT_STALE_MAX_AGE_MS = 30 * 60 * 1000;
-const ACCOUNT_INDEX_MAX_PAGES = 25;
+const ACCOUNT_INDEX_MAX_PAGES = 40;
+const ACCOUNT_MEMBERSHIP_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const WATERMARK_SAFETY_MS = 12 * 60 * 60 * 1000;
+const ACCOUNT_INDEX_STORAGE_KEY = 'account-delta-index:v1';
 const ACCOUNT_UNAVAILABLE_TTL_MS = 15 * 60 * 1000;
 const STALE_BROWSE_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 25 * 1000;
@@ -184,7 +187,20 @@ type AccountPage = {
   readonly checkedAt: number;
   readonly novels: Plugin.NovelItem[];
   readonly updateDates: ReadonlyMap<string, number>;
+  readonly firstUpdatedBefore?: number;
+  readonly lastUpdatedBefore?: number;
+  readonly isDescendingByDate: boolean;
   readonly next: boolean;
+};
+
+type PersistedAccountIndex = {
+  readonly accountId?: string;
+  readonly followsMembers: string[];
+  readonly favoritesMembers: string[];
+  readonly fullLists: Partial<Record<AccountList, boolean>>;
+  readonly listSyncedAt: Partial<Record<AccountList, number>>;
+  readonly fullIndexAt?: number;
+  readonly pendingRetries: Record<string, number>;
 };
 
 type AccountDeltaState = {
@@ -328,7 +344,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.11.1';
+  version = '1.12.0';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -1342,6 +1358,58 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     this.accountPages.clear();
     this.accountPageNext.clear();
     this.accountDelta = undefined;
+    storage.delete(ACCOUNT_INDEX_STORAGE_KEY);
+  }
+
+  private emptyPersistedAccountIndex(): PersistedAccountIndex {
+    return {
+      followsMembers: [],
+      favoritesMembers: [],
+      fullLists: {},
+      listSyncedAt: {},
+      pendingRetries: {},
+    };
+  }
+
+  private readPersistedAccountIndex(now: number): PersistedAccountIndex {
+    const raw = storage.get<PersistedAccountIndex>(ACCOUNT_INDEX_STORAGE_KEY);
+    if (!raw || typeof raw !== 'object') return this.emptyPersistedAccountIndex();
+    const expiredMembership =
+      typeof raw.fullIndexAt === 'number' &&
+      now - raw.fullIndexAt > ACCOUNT_MEMBERSHIP_TTL_MS;
+    return {
+      accountId: typeof raw.accountId === 'string' ? raw.accountId : undefined,
+      followsMembers: Array.isArray(raw.followsMembers)
+        ? raw.followsMembers.filter(id => typeof id === 'string')
+        : [],
+      favoritesMembers: Array.isArray(raw.favoritesMembers)
+        ? raw.favoritesMembers.filter(id => typeof id === 'string')
+        : [],
+      fullLists:
+        !expiredMembership && raw.fullLists && typeof raw.fullLists === 'object'
+          ? { ...raw.fullLists }
+          : {},
+      listSyncedAt:
+        raw.listSyncedAt && typeof raw.listSyncedAt === 'object'
+          ? { ...raw.listSyncedAt }
+          : {},
+      fullIndexAt:
+        !expiredMembership && typeof raw.fullIndexAt === 'number'
+          ? raw.fullIndexAt
+          : undefined,
+      pendingRetries:
+        raw.pendingRetries && typeof raw.pendingRetries === 'object'
+          ? { ...raw.pendingRetries }
+          : {},
+    };
+  }
+
+  private writePersistedAccountIndex(index: PersistedAccountIndex) {
+    storage.set<PersistedAccountIndex>(
+      ACCOUNT_INDEX_STORAGE_KEY,
+      index,
+      Date.now() + BASELINE_TTL_MS,
+    );
   }
 
   private ensureAccountDelta(now: number): AccountDeltaState {
@@ -1412,39 +1480,6 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         return [];
     }
     return (await this.accountPage(list, pageNo, 'interactive')).novels;
-  }
-
-  private async populateAccountDelta(
-    wantedPaths: readonly string[],
-    onProgress?: (statusText: string) => void,
-  ): Promise<AccountDeltaState | undefined> {
-    const now = Date.now();
-    if (now < this.accountUnavailableUntil) return;
-    const delta = this.ensureAccountDelta(now);
-    const allFound = () =>
-      wantedPaths.every(path => delta.dates.has(path));
-    if (delta.done || allFound()) return delta;
-
-    try {
-      while (
-        !delta.done &&
-        delta.pagesScanned < ACCOUNT_INDEX_MAX_PAGES &&
-        delta.listIndex < ACCOUNT_LIST_ORDER.length
-      ) {
-        await this.advanceAccountDeltaPage(delta, onProgress);
-        // Stop if an account switch replaced this scan state.
-        if (this.accountDelta !== delta) return;
-        if (allFound()) break;
-      }
-      if (delta.pagesScanned >= ACCOUNT_INDEX_MAX_PAGES) delta.done = true;
-    } catch (error) {
-      if (error instanceof Error && error.name === 'AccountListError') {
-        this.accountUnavailableUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
-        return;
-      }
-      throw error;
-    }
-    return delta;
   }
 
   private async lookupAccountDelta(
@@ -1704,6 +1739,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     const accountId = this.extractAccountId($);
     const novels = new Map<string, Plugin.NovelItem>();
     const updateDates = new Map<string, number>();
+    const orderedDates: number[] = [];
     let next = false;
     const relative = path.slice(path.lastIndexOf('/') + 1);
     const mobilePath = this.mobileFallbackUrl(`${this.site}${path}`).replace(
@@ -1769,7 +1805,10 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             }
           }
         }
-        if (date !== undefined) updateDates.set(storyPath, date);
+        if (date !== undefined) {
+          updateDates.set(storyPath, date);
+          orderedDates.push(date);
+        }
       }
 
       const [linkPath, query] = href.split('?');
@@ -1798,11 +1837,21 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         'FanFiction.Net returned an unexpected story list. Try opening it in WebView.',
       );
     }
+    let isDescendingByDate = orderedDates.length >= 2;
+    for (let i = 1; i < orderedDates.length; i += 1) {
+      if (orderedDates[i] > orderedDates[i - 1]) {
+        isDescendingByDate = false;
+        break;
+      }
+    }
     return {
       accountId,
       checkedAt: Date.now(),
       novels: Array.from(novels.values()),
       updateDates,
+      firstUpdatedBefore: orderedDates[0],
+      lastUpdatedBefore: orderedDates[orderedDates.length - 1],
+      isDescendingByDate,
       next,
     };
   }
@@ -1970,22 +2019,182 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       };
     });
 
-    const wantedPaths: string[] = [];
+    const wantedIds: string[] = [];
     const seenWanted = new Set<string>();
     for (const item of normalized) {
-      if (item.storyPath && !seenWanted.has(item.storyPath)) {
-        seenWanted.add(item.storyPath);
-        wantedPaths.push(item.storyPath);
+      if (item.id && !seenWanted.has(item.id)) {
+        seenWanted.add(item.id);
+        wantedIds.push(item.id);
       }
     }
 
-    const delta = await this.populateAccountDelta(
-      wantedPaths,
-      options?.onProgress,
-    );
-    if (!delta || delta.dates.size === 0) return;
+    let persisted = this.readPersistedAccountIndex(now);
+    let resolvedAccountId = persisted.accountId;
+    let followsMembers = new Set<string>(persisted.followsMembers);
+    let favoritesMembers = new Set<string>(persisted.favoritesMembers);
+    let fullLists: Partial<Record<AccountList, boolean>> = {
+      ...persisted.fullLists,
+    };
+    let listSyncedAt: Partial<Record<AccountList, number>> = {
+      ...persisted.listSyncedAt,
+    };
+    let fullIndexAt = persisted.fullIndexAt;
+    let pendingRetries: Record<string, number> = {
+      ...persisted.pendingRetries,
+    };
+
+    const deltaDates = new Map<string, number>();
+    const deltaTitles = new Map<string, string>();
+    const completedLists: Partial<Record<AccountList, boolean>> = {};
+    let pagesScanned = 0;
+
+    try {
+      for (const list of ACCOUNT_LIST_ORDER) {
+        if (pagesScanned >= ACCOUNT_INDEX_MAX_PAGES) break;
+
+        // If Story Alerts already covers every candidate (by live date or known membership), skip Favorites.
+        if (
+          list === 'favorites' &&
+          completedLists.follows &&
+          wantedIds.every(
+            id => deltaDates.has(`s/${id}/`) || followsMembers.has(id),
+          )
+        ) {
+          continue;
+        }
+
+        const listLabel = list === 'follows' ? 'Story Alerts' : 'Favorites';
+        const listMembers =
+          list === 'follows' ? followsMembers : favoritesMembers;
+        const watermark = listSyncedAt[list];
+        const uncoveredWanted = wantedIds.filter(
+          id =>
+            !deltaDates.has(`s/${id}/`) &&
+            !(completedLists.follows && followsMembers.has(id)),
+        );
+        let canEarlyStop =
+          watermark !== undefined &&
+          (fullLists[list] === true ||
+            uncoveredWanted.every(id => listMembers.has(id)));
+
+        let page = 1;
+        let listDescending = true;
+        let prevLastDate: number | undefined;
+
+        while (pagesScanned < ACCOUNT_INDEX_MAX_PAGES) {
+          options?.onProgress?.(
+            `FanFiction.Net: scanning ${listLabel} (page ${page})`,
+          );
+          pagesScanned += 1;
+          const result = await this.accountPage(list, page, 'background');
+
+          if (result.accountId) {
+            if (
+              resolvedAccountId !== undefined &&
+              resolvedAccountId !== result.accountId
+            ) {
+              persisted = this.emptyPersistedAccountIndex();
+              followsMembers = new Set<string>();
+              favoritesMembers = new Set<string>();
+              fullLists = {};
+              listSyncedAt = {};
+              fullIndexAt = undefined;
+              pendingRetries = {};
+              canEarlyStop = false;
+            }
+            resolvedAccountId = result.accountId;
+          }
+
+          const currentMembers =
+            list === 'follows' ? followsMembers : favoritesMembers;
+          for (const item of result.novels) {
+            const itemId = this.storyId('/' + item.path);
+            if (itemId) currentMembers.add(itemId);
+            if (item.name && !deltaTitles.has(item.path)) {
+              deltaTitles.set(item.path, item.name);
+            }
+          }
+          result.updateDates.forEach((updatedBefore, path) => {
+            const existing = deltaDates.get(path);
+            if (existing === undefined || updatedBefore > existing)
+              deltaDates.set(path, updatedBefore);
+          });
+
+          const missingDatesOnFirstPage =
+            page === 1 &&
+            result.novels.length > 0 &&
+            result.updateDates.size === 0;
+          if (missingDatesOnFirstPage) {
+            break;
+          }
+
+          if (
+            prevLastDate !== undefined &&
+            result.firstUpdatedBefore !== undefined &&
+            result.firstUpdatedBefore > prevLastDate
+          ) {
+            listDescending = false;
+          }
+          if (result.updateDates.size >= 2 && !result.isDescendingByDate) {
+            listDescending = false;
+          }
+          if (result.lastUpdatedBefore !== undefined) {
+            prevLastDate = result.lastUpdatedBefore;
+          }
+
+          const reachedWatermark =
+            canEarlyStop &&
+            watermark !== undefined &&
+            listDescending &&
+            result.lastUpdatedBefore !== undefined &&
+            result.lastUpdatedBefore < watermark - WATERMARK_SAFETY_MS;
+
+          if (reachedWatermark) {
+            completedLists[list] = true;
+            break;
+          }
+
+          if (!result.next) {
+            completedLists[list] = true;
+            fullLists[list] = true;
+            break;
+          }
+
+          if (
+            !canEarlyStop &&
+            wantedIds.length > 0 &&
+            wantedIds.every(
+              id =>
+                deltaDates.has(`s/${id}/`) ||
+                (completedLists.follows && followsMembers.has(id)),
+            )
+          ) {
+            completedLists[list] = true;
+            break;
+          }
+
+          page += 1;
+        }
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AccountListError') {
+        this.accountUnavailableUntil = Date.now() + ACCOUNT_UNAVAILABLE_TTL_MS;
+        return;
+      }
+      throw error;
+    }
+
+    if (
+      deltaDates.size === 0 &&
+      !completedLists.follows &&
+      !completedLists.favorites
+    ) {
+      return;
+    }
 
     const pathsToUpdate: string[] = [];
+    const nextPendingRetries: Record<string, number> = { ...pendingRetries };
+
     for (const { candidate, id, storyPath } of normalized) {
       if (!id || !storyPath) {
         pathsToUpdate.push(candidate.path);
@@ -1994,23 +2203,32 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
 
       const baseline = storage.get<NovelBaseline>(`novel-baseline:${id}`);
       if (baseline && now - baseline.fetchedAt < NOVEL_TTL_MS) {
+        delete nextPendingRetries[id];
         this.requestStats.cacheHits += 1;
         continue;
       }
 
-      const deltaUpdatedBefore = delta.dates.get(storyPath);
+      const liveUpdatedBefore = deltaDates.get(storyPath);
+      const retryUpdatedBefore = pendingRetries[id];
+      const deltaUpdatedBefore =
+        liveUpdatedBefore !== undefined && retryUpdatedBefore !== undefined
+          ? Math.max(liveUpdatedBefore, retryUpdatedBefore)
+          : (liveUpdatedBefore ?? retryUpdatedBefore);
+
       const isCompleted =
         candidate.status === NovelStatus.Completed ||
         baseline?.novel.status === NovelStatus.Completed;
 
       if (deltaUpdatedBefore !== undefined) {
         if (baseline && deltaUpdatedBefore <= baseline.fetchedAt) {
+          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
 
         const marker = storage.get<NovelDeltaMarker>(`novel-delta:${id}`);
         if (marker && deltaUpdatedBefore <= marker.seenUpdatedBefore) {
+          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
@@ -2028,10 +2246,11 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             {
               seenUpdatedBefore: deltaUpdatedBefore,
               checkedAt: now,
-              name: delta.titles.get(storyPath) ?? candidate.name,
+              name: deltaTitles.get(storyPath) ?? candidate.name,
             },
             now + BASELINE_TTL_MS,
           );
+          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
@@ -2047,15 +2266,27 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             {
               seenUpdatedBefore: deltaUpdatedBefore,
               checkedAt: now,
-              name: delta.titles.get(storyPath) ?? candidate.name,
+              name: deltaTitles.get(storyPath) ?? candidate.name,
             },
             now + BASELINE_TTL_MS,
           );
+          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
 
         pathsToUpdate.push(candidate.path);
+        nextPendingRetries[id] = deltaUpdatedBefore;
+        continue;
+      }
+
+      // Not present in the scanned window — if this story is a known member of a
+      // list that completed or early-stopped past the watermark, it has not updated.
+      if (
+        (completedLists.follows && followsMembers.has(id)) ||
+        (completedLists.favorites && favoritesMembers.has(id))
+      ) {
+        this.requestStats.cacheHits += 1;
         continue;
       }
 
@@ -2073,6 +2304,22 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       }
       pathsToUpdate.push(candidate.path);
     }
+
+    if (completedLists.follows) listSyncedAt.follows = now;
+    if (completedLists.favorites) listSyncedAt.favorites = now;
+    if (fullLists.follows && fullLists.favorites && fullIndexAt === undefined) {
+      fullIndexAt = now;
+    }
+
+    this.writePersistedAccountIndex({
+      accountId: resolvedAccountId,
+      followsMembers: Array.from(followsMembers),
+      favoritesMembers: Array.from(favoritesMembers),
+      fullLists,
+      listSyncedAt,
+      fullIndexAt,
+      pendingRetries: nextPendingRetries,
+    });
 
     return pathsToUpdate;
   }

@@ -953,3 +953,260 @@ test('checkLibraryUpdates stops immediately when onProgress throws (task cancell
   );
   assert.equal(requests.length, 1);
 });
+
+test('checkLibraryUpdates early-stops at page 1 on repeat runs and skips Favorites when Story Alerts covers all candidates', async () => {
+  const requests = [];
+  let page1Updated = false;
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    if (url.includes('/favorites/story.php')) {
+      throw new Error('Favorites should not be fetched when Story Alerts covers all candidates');
+    }
+    const pageMatch = url.match(/[?&]p=(\d+)/);
+    const page = pageMatch ? Number(pageMatch[1]) : 1;
+    const start = (page - 1) * 50 + 1;
+    const end = page * 50;
+    const nextPage = page < 10 ? page + 1 : undefined;
+
+    if (page === 1 && page1Updated) {
+      return new Response(
+        accountPage(500, 500, 500, 2, {
+          listLabel: 'Stories you are following',
+          updated: () => '11-23-2026',
+        }).replace(
+          '</table>',
+          '<tr><td><a href="/s/1/1/Story-1">Story 1</a></td><td><a href="/u/9/Author/">Author</a></td><td>Books</td><td>11-10-2026</td></tr></table>',
+        ),
+      );
+    }
+
+    const pageDate =
+      page === 1
+        ? id => (id === 1 ? '11-18-2026' : '11-10-2026')
+        : () => `10-${String(20 - page).padStart(2, '0')}-2026`;
+
+    return new Response(
+      accountPage(start, end, 500, nextPage, {
+        listLabel: 'Stories you are following',
+        updated: pageDate,
+      }),
+    );
+  });
+
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-11-18T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/250/', name: 'Story 250', lastUpdatedAt: '2026-10-15T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/500/', name: 'Story 500', lastUpdatedAt: '2026-10-10T12:00:00.000Z', status: 'Ongoing' },
+  ];
+
+  // Run 1: one-time membership scan of Story Alerts (10 pages), skipping Favorites completely.
+  const firstRun = await plugin.checkLibraryUpdates(candidates);
+  assert.deepEqual(Array.from(firstRun), []);
+  assert.equal(requests.length, 10);
+
+  // Run 2: two days later, Story 500 updates and moves to top of Page 1; bottom of Page 1 is 11-10-2026 (< watermark - 12h).
+  requests.length = 0;
+  page1Updated = true;
+  time.now += 2 * 24 * 60 * 60 * 1000;
+  const secondRun = await plugin.checkLibraryUpdates(candidates);
+  assert.deepEqual(Array.from(secondRun), ['s/500/']);
+  // Only Page 1 fetched! Pages 2..10 and Favorites completely skipped.
+  assert.equal(requests.length, 1);
+});
+
+test('checkLibraryUpdates scans multiple pages during catch-up after a long gap then stops past watermark', async () => {
+  const requests = [];
+  let afterGap = false;
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    const pageMatch = url.match(/[?&]p=(\d+)/);
+    const page = pageMatch ? Number(pageMatch[1]) : 1;
+    const start = (page - 1) * 50 + 1;
+    const end = page * 50;
+    const nextPage = page < 6 ? page + 1 : undefined;
+
+    if (!afterGap) {
+      return new Response(
+        accountPage(start, end, 300, nextPage, {
+          listLabel: 'Stories you are following',
+          updated: () => `10-${String(20 - page).padStart(2, '0')}-2026`,
+        }),
+      );
+    }
+
+    if (page === 1) {
+      // All entries on Page 1 are newer than the Nov 21 watermark -> must continue to Page 2.
+      return new Response(
+        accountPage(1, 50, 300, 2, {
+          listLabel: 'Stories you are following',
+          updated: id => (id === 1 ? '12-01-2026' : '11-25-2026'),
+        }),
+      );
+    }
+    if (page === 2) {
+      // Top of Page 2 is after watermark (11-24-2026), bottom is before watermark (11-10-2026) -> stop after Page 2.
+      return new Response(
+        accountPage(51, 100, 300, 3, {
+          listLabel: 'Stories you are following',
+          updated: id => (id === 51 ? '11-24-2026' : '11-10-2026'),
+        }),
+      );
+    }
+    throw new Error(`Should not have scanned page ${page} past watermark`);
+  });
+
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-10-19T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/51/', name: 'Story 51', lastUpdatedAt: '2026-10-18T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/300/', name: 'Story 300', lastUpdatedAt: '2026-10-14T12:00:00.000Z', status: 'Ongoing' },
+  ];
+
+  await plugin.checkLibraryUpdates(candidates);
+  assert.equal(requests.length, 6);
+
+  requests.length = 0;
+  afterGap = true;
+  time.now += 10 * 24 * 60 * 60 * 1000;
+  const secondRun = await plugin.checkLibraryUpdates(candidates);
+  assert.deepEqual(Array.from(secondRun), ['s/1/', 's/51/']);
+  assert.equal(requests.length, 2);
+});
+
+test('checkLibraryUpdates falls back to full scan when listing dates are not descending', async () => {
+  const requests = [];
+  let unsortedRun = false;
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    const pageMatch = url.match(/[?&]p=(\d+)/);
+    const page = pageMatch ? Number(pageMatch[1]) : 1;
+    const start = (page - 1) * 50 + 1;
+    const end = page * 50;
+    const nextPage = page < 3 ? page + 1 : undefined;
+
+    if (!unsortedRun) {
+      return new Response(
+        accountPage(start, end, 150, nextPage, {
+          listLabel: 'Stories you are following',
+          updated: () => `10-${String(20 - page).padStart(2, '0')}-2026`,
+        }),
+      );
+    }
+
+    if (page === 1) {
+      // Non-descending dates (older row followed by newer row, ending before watermark).
+      return new Response(
+        accountPage(1, 50, 150, 2, {
+          listLabel: 'Stories you are following',
+          updated: id => (id === 1 ? '10-01-2026' : id === 2 ? '11-10-2026' : '10-01-2026'),
+        }),
+      );
+    }
+    if (page === 2) {
+      return new Response(
+        accountPage(51, 100, 150, 3, {
+          listLabel: 'Stories you are following',
+          updated: id => (id === 75 ? '11-25-2026' : '10-01-2026'),
+        }),
+      );
+    }
+    return new Response(
+      accountPage(101, 150, 150, undefined, {
+        listLabel: 'Stories you are following',
+        updated: () => '10-01-2026',
+      }),
+    );
+  });
+
+  const candidates = [
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-10-19T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/75/', name: 'Story 75', lastUpdatedAt: '2026-10-18T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/150/', name: 'Story 150', lastUpdatedAt: '2026-10-17T12:00:00.000Z', status: 'Ongoing' },
+  ];
+
+  await plugin.checkLibraryUpdates(candidates);
+  assert.equal(requests.length, 3);
+
+  requests.length = 0;
+  unsortedRun = true;
+  time.now += 5 * 24 * 60 * 60 * 1000;
+  const secondRun = await plugin.checkLibraryUpdates(candidates);
+  // Must NOT early-stop after Page 1 because Page 1 was not sorted newest-first!
+  assert.deepEqual(Array.from(secondRun), ['s/75/']);
+  assert.equal(requests.length, 3);
+});
+
+test('checkLibraryUpdates preserves pending retries across unrelated category updates and early-stopped runs', async () => {
+  const requests = [];
+  let phase = 1;
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    const pageMatch = url.match(/[?&]p=(\d+)/);
+    const page = pageMatch ? Number(pageMatch[1]) : 1;
+
+    if (phase === 1) {
+      if (page === 1) {
+        return new Response(
+          accountPage(1, 50, 100, 2, {
+            listLabel: 'Stories you are following',
+            updated: id => (id === 1 ? '11-21-2026' : '11-10-2026'),
+          }),
+        );
+      }
+      return new Response(
+        accountPage(51, 100, 100, undefined, {
+          listLabel: 'Stories you are following',
+          updated: () => '10-10-2026',
+        }),
+      );
+    }
+
+    // Later runs: Page 1 only has older dates (before watermark - 12h), so it stops at Page 1
+    // and never scans Page 2 where Story 1 now sits.
+    if (page === 1) {
+      return new Response(
+        accountPage(2, 51, 100, 2, {
+          listLabel: 'Stories you are following',
+          updated: () => '11-10-2026',
+        }),
+      );
+    }
+    throw new Error('Should have early-stopped on Page 1');
+  });
+
+  // Run 1: Story 1 has a new update (11-21-2026), returned for update, then fetch fails/cancels.
+  const run1 = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-10-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/100/', name: 'Story 100', lastUpdatedAt: '2026-10-10T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(run1), ['s/1/']);
+
+  // Run 2: 4 days later, user runs an unrelated single-category update containing only Story 100.
+  phase = 2;
+  requests.length = 0;
+  time.now += 4 * 24 * 60 * 60 * 1000;
+  const run2 = await plugin.checkLibraryUpdates([
+    { path: 's/100/', name: 'Story 100', lastUpdatedAt: '2026-10-10T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(run2), []);
+  assert.equal(requests.length, 1);
+
+  // Run 3: Full library update early-stops at Page 1 (never sees Story 1), yet still retries Story 1!
+  requests.length = 0;
+  time.now += 24 * 60 * 60 * 1000;
+  const run3 = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-10-01T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/100/', name: 'Story 100', lastUpdatedAt: '2026-10-10T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(run3), ['s/1/']);
+  assert.equal(requests.length, 1);
+
+  // Run 4: Once Story 1's DB lastUpdatedAt catches up to 11-21-2026, pending retry clears.
+  requests.length = 0;
+  time.now += 24 * 60 * 60 * 1000;
+  const run4 = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-11-21T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/100/', name: 'Story 100', lastUpdatedAt: '2026-10-10T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(run4), []);
+  assert.equal(requests.length, 1);
+});
