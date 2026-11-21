@@ -4,7 +4,7 @@
     "name": "FanFiction.Net",
     "site": "https://www.fanfiction.net",
     "lang": "English",
-    "version": "1.10.2",
+    "version": "1.11.0",
     "url": "https://raw.githubusercontent.com/saigauthamr/tao-lnreader-plugins/plugins/v3.0.0/.js/src/plugins/english/fanfictionnet.js",
     "iconUrl": "https://raw.githubusercontent.com/saigauthamr/tao-lnreader-plugins/plugins/v3.0.0/public/static/src/en/fanfictionnet/icon.png"
   }
