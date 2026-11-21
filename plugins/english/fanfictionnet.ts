@@ -203,7 +203,7 @@ type PersistedAccountIndex = {
   readonly fullLists: Partial<Record<AccountList, boolean>>;
   readonly listSyncedAt: Partial<Record<AccountList, number>>;
   readonly fullIndexAt?: number;
-  readonly pendingRetries: Record<string, number>;
+  readonly seenDates: Record<string, number>;
 };
 
 type AccountDeltaState = {
@@ -347,7 +347,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
   name = 'FanFiction.Net';
   icon = 'src/en/fanfictionnet/icon.png';
   site = 'https://www.fanfiction.net';
-  version = '1.12.1';
+  version = '1.12.2';
   imageRequestInit: Plugin.ImageRequestInit = {
     headers: {
       'Referer': 'https://www.fanfiction.net/',
@@ -1370,16 +1370,28 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       favoritesMembers: [],
       fullLists: {},
       listSyncedAt: {},
-      pendingRetries: {},
+      seenDates: {},
     };
   }
 
   private readPersistedAccountIndex(now: number): PersistedAccountIndex {
-    const raw = storage.get<PersistedAccountIndex>(ACCOUNT_INDEX_STORAGE_KEY);
+    const raw = storage.get<
+      PersistedAccountIndex & { pendingRetries?: Record<string, number> }
+    >(ACCOUNT_INDEX_STORAGE_KEY);
     if (!raw || typeof raw !== 'object') return this.emptyPersistedAccountIndex();
     const expiredMembership =
       typeof raw.fullIndexAt === 'number' &&
       now - raw.fullIndexAt > ACCOUNT_MEMBERSHIP_TTL_MS;
+    const seenDates: Record<string, number> = {};
+    for (const source of [raw.pendingRetries, raw.seenDates]) {
+      if (!source || typeof source !== 'object') continue;
+      for (const [id, ts] of Object.entries(source)) {
+        if (typeof ts === 'number' && Number.isFinite(ts)) {
+          const prev = seenDates[id];
+          if (prev === undefined || ts > prev) seenDates[id] = ts;
+        }
+      }
+    }
     return {
       accountId: typeof raw.accountId === 'string' ? raw.accountId : undefined,
       followsMembers: Array.isArray(raw.followsMembers)
@@ -1400,10 +1412,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
         !expiredMembership && typeof raw.fullIndexAt === 'number'
           ? raw.fullIndexAt
           : undefined,
-      pendingRetries:
-        raw.pendingRetries && typeof raw.pendingRetries === 'object'
-          ? { ...raw.pendingRetries }
-          : {},
+      seenDates,
     };
   }
 
@@ -2044,8 +2053,8 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       ...persisted.listSyncedAt,
     };
     let fullIndexAt = persisted.fullIndexAt;
-    let pendingRetries: Record<string, number> = {
-      ...persisted.pendingRetries,
+    let seenDates: Record<string, number> = {
+      ...persisted.seenDates,
     };
 
     const deltaDates = new Map<string, number>();
@@ -2109,7 +2118,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
               fullLists = {};
               listSyncedAt = {};
               fullIndexAt = undefined;
-              pendingRetries = {};
+              seenDates = {};
               canEarlyStop = false;
             }
             resolvedAccountId = result.accountId;
@@ -2128,6 +2137,13 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             const existing = deltaDates.get(path);
             if (existing === undefined || updatedBefore > existing)
               deltaDates.set(path, updatedBefore);
+            const itemId = this.storyId('/' + path);
+            if (itemId) {
+              const prevSeen = seenDates[itemId];
+              if (prevSeen === undefined || updatedBefore > prevSeen) {
+                seenDates[itemId] = updatedBefore;
+              }
+            }
           });
 
           const missingDatesOnFirstPage =
@@ -2203,7 +2219,6 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
     }
 
     const pathsToUpdate: string[] = [];
-    const nextPendingRetries: Record<string, number> = { ...pendingRetries };
 
     for (const { candidate, id, storyPath } of normalized) {
       if (!id || !storyPath) {
@@ -2213,17 +2228,16 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
 
       const baseline = storage.get<NovelBaseline>(`novel-baseline:${id}`);
       if (baseline && now - baseline.fetchedAt < NOVEL_TTL_MS) {
-        delete nextPendingRetries[id];
         this.requestStats.cacheHits += 1;
         continue;
       }
 
       const liveUpdatedBefore = deltaDates.get(storyPath);
-      const retryUpdatedBefore = pendingRetries[id];
+      const persistedUpdatedBefore = seenDates[id];
       const deltaUpdatedBefore =
-        liveUpdatedBefore !== undefined && retryUpdatedBefore !== undefined
-          ? Math.max(liveUpdatedBefore, retryUpdatedBefore)
-          : (liveUpdatedBefore ?? retryUpdatedBefore);
+        liveUpdatedBefore !== undefined && persistedUpdatedBefore !== undefined
+          ? Math.max(liveUpdatedBefore, persistedUpdatedBefore)
+          : (liveUpdatedBefore ?? persistedUpdatedBefore);
 
       const isCompleted =
         candidate.status === NovelStatus.Completed ||
@@ -2231,14 +2245,12 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
 
       if (deltaUpdatedBefore !== undefined) {
         if (baseline && deltaUpdatedBefore <= baseline.fetchedAt) {
-          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
 
         const marker = storage.get<NovelDeltaMarker>(`novel-delta:${id}`);
         if (marker && deltaUpdatedBefore <= marker.seenUpdatedBefore) {
-          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
@@ -2260,7 +2272,6 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             },
             now + BASELINE_TTL_MS,
           );
-          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
@@ -2280,13 +2291,11 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
             },
             now + BASELINE_TTL_MS,
           );
-          delete nextPendingRetries[id];
           this.requestStats.cacheHits += 1;
           continue;
         }
 
         pathsToUpdate.push(candidate.path);
-        nextPendingRetries[id] = deltaUpdatedBefore;
         continue;
       }
 
@@ -2328,7 +2337,7 @@ class FanFictionNetPlugin implements Plugin.PluginBase {
       fullLists,
       listSyncedAt,
       fullIndexAt,
-      pendingRetries: nextPendingRetries,
+      seenDates,
     });
 
     return pathsToUpdate;

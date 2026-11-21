@@ -1285,3 +1285,98 @@ test('uses shorter freshness TTLs for checkLibraryUpdates, manual novel refresh,
   await plugin.parseNovel('s/1/', 'interactive');
   assert.equal(requests.length, 2);
 });
+
+test('checkLibraryUpdates remembers seenDates for excluded-category stories when watermark advances past them', async () => {
+  const requests = [];
+  let phase = 1;
+  const { plugin, time } = harness(async url => {
+    requests.push(url);
+    const pageMatch = url.match(/[?&]p=(\d+)/);
+    const page = pageMatch ? Number(pageMatch[1]) : 1;
+
+    if (phase === 1) {
+      // Cold membership scan: Story 1 (Active) on page 1, Story 80 (Hiatus) on page 2.
+      if (page === 1) {
+        return new Response(
+          accountPage(1, 50, 100, 2, {
+            listLabel: 'Stories you are following',
+            updated: () => '11-10-2026',
+          }),
+        );
+      }
+      return new Response(
+        accountPage(51, 100, 100, undefined, {
+          listLabel: 'Stories you are following',
+          updated: () => '05-01-2025',
+        }),
+      );
+    }
+
+    if (phase === 2) {
+      // Day 2: Story 80 (Hiatus) wakes up and hits Page 1 (11-23-2026), while user runs Global Update
+      // with ONLY Active stories (Story 80 excluded from candidates).
+      if (page === 1) {
+        return new Response(
+          accountPage(80, 80, 100, 2, {
+            listLabel: 'Stories you are following',
+            updated: () => '11-23-2026',
+          }).replace(
+            '</table>',
+            '<tr><td><a href="/s/1/1/">Story 1</a></td><td><a href="/u/9/A/">A</a></td><td>F</td><td>11-10-2026</td></tr></table>',
+          ),
+        );
+      }
+      throw new Error('Phase 2 should early-stop on Page 1');
+    }
+
+    // Day 6: Story 80 has scrolled off Page 1 (Page 1 ends at 11-15-2026 < Nov 23 watermark - 12h),
+    // and user now pulls-to-refresh the Hiatus category (containing Story 80).
+    if (page === 1) {
+      return new Response(
+        accountPage(1, 50, 100, 2, {
+          listLabel: 'Stories you are following',
+          updated: () => '11-15-2026',
+        }),
+      );
+    }
+    throw new Error('Phase 3 should early-stop on Page 1');
+  });
+
+  // Phase 1: Full library scan learns both Story 1 and Story 80.
+  const p1 = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-11-10T12:00:00.000Z', status: 'Ongoing' },
+    { path: 's/80/', name: 'Story 80', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(p1), []);
+  assert.equal(requests.length, 2);
+
+  // Phase 2: Global Update with Hiatus excluded (only Story 1 passed) sees Story 80 on Page 1 and advances watermark.
+  phase = 2;
+  requests.length = 0;
+  time.now += 2 * 24 * 60 * 60 * 1000;
+  const p2 = await plugin.checkLibraryUpdates([
+    { path: 's/1/', name: 'Story 1', lastUpdatedAt: '2026-11-10T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(p2), []);
+  assert.equal(requests.length, 1);
+
+  // Phase 3: 4 days later, user refreshes Hiatus category (Story 80). Page 1 early-stops without Story 80,
+  // yet seenDates still catches Story 80's Nov 23 update!
+  phase = 3;
+  requests.length = 0;
+  time.now += 4 * 24 * 60 * 60 * 1000;
+  const p3 = await plugin.checkLibraryUpdates([
+    { path: 's/80/', name: 'Story 80', lastUpdatedAt: '2025-05-01T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(p3), ['s/80/']);
+  assert.equal(requests.length, 1);
+
+  // Phase 4: Once Story 80's DB catches up to 2026-11-23, it is no longer queued.
+  requests.length = 0;
+  time.now += 60_000;
+  const p4 = await plugin.checkLibraryUpdates([
+    { path: 's/80/', name: 'Story 80', lastUpdatedAt: '2026-11-23T12:00:00.000Z', status: 'Ongoing' },
+  ]);
+  assert.deepEqual(Array.from(p4), []);
+  assert.equal(requests.length, 1);
+});
